@@ -1,0 +1,16 @@
+# .NET build output
+bin/
+obj/
+
+# Bundled driver payloads (not redistributed in source; see installer/redist/README.txt)
+installer/redist/*.exe
+
+# Inno Setup output
+installer/Output/
+*.iss.bak
+
+# IDE
+.vs/
+*.user
+
+publish
