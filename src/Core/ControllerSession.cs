@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using HidSharp;
 using Microsoft.Win32.SafeHandles;
 using Nefarius.ViGEm.Client;
 using Nefarius.ViGEm.Client.Targets;
@@ -29,6 +30,7 @@ internal sealed class ControllerSession : IDisposable
     public string ProductName => _unit.ProductName;
     public SessionStatus Status => _status;
     public string? FaultReason { get; private set; }
+    public bool RawInputVisible { get; private set; }
 
     private readonly GamepadUnit _unit;
     private readonly IntPtr _coopHwnd;
@@ -46,9 +48,10 @@ internal sealed class ControllerSession : IDisposable
     private IDirectInputDevice8? _dev;
     private CooperativeLevel _coop;
     private SafeFileHandle? _rumble;
+    private HidStream? _hidReader;
+    private readonly byte[] _rxInput = new byte[64];
     private IXbox360Controller? _pad;
     private bool _cloaked;
-    private bool _keepCloak;   // rebuild for the same physical slot - leave the HidHide block in place
 
     private Thread? _thread;
     private volatile bool _stop;
@@ -99,16 +102,28 @@ internal sealed class ControllerSession : IDisposable
         {
             OpenRumbleHandleStep();
             CloakStep();
-            OpenDeviceStep();
-            AcquireStep();
-            VerifyPairingStep();
-            SendIdle();
-            VirtualPadStep();   // wires FeedbackReceived only after pairing is verified
+
+            ThreadStart loop;
+            if (_unit.RawHidInput)
+            {
+                OpenRawHidReaderStep();
+                VirtualPadStep();
+                loop = RawHidReadThread;
+            }
+            else
+            {
+                OpenDeviceStep();
+                AcquireStep();
+                VerifyPairingStep();
+                SendIdle();
+                VirtualPadStep();   // wires FeedbackReceived only after pairing is verified
+                loop = PollThread;
+            }
 
             _status = SessionStatus.Running;
-            _thread = new Thread(PollThread) { Name = $"Poll-{ShortId}", IsBackground = true, Priority = ThreadPriority.AboveNormal };
+            _thread = new Thread(loop) { Name = $"Input-{ShortId}", IsBackground = true, Priority = ThreadPriority.AboveNormal };
             _thread.Start();
-            Log.Info($"[{ShortId}] session RUNNING");
+            Log.Info($"[{ShortId}] session RUNNING ({(_unit.RawHidInput ? "raw HID" : "DirectInput")})");
         }
         catch (Exception ex)
         {
@@ -132,6 +147,12 @@ internal sealed class ControllerSession : IDisposable
                     "No raw HID device paired to this unit - rumble can't be routed. " +
                     "Set RequireHidPairing=false in config.json for input-only.");
             Log.Warn($"[{ShortId}] no paired HID path - input-only, rumble disabled");
+            return;
+        }
+
+        if (_unit.HidMaxOutputLength <= 0)
+        {
+            Log.Info($"[{ShortId}] paired HID device has no output report - input-only (this device can't rumble)");
             return;
         }
 
@@ -170,7 +191,16 @@ internal sealed class ControllerSession : IDisposable
         }
 
         _cloaked = _hidHide.CloakDevice(_unit.HidHideInstancePath, _ownExe);
-        if (_cloaked) return;
+        if (_cloaked)
+        {
+            if (_unit.HasHidPath && RawInputDevices.IsListed(_unit.HidDevicePath!))
+            {
+                RawInputVisible = true;
+                Log.Warn($"[{ShortId}] device was already present before it was hidden - RawInput apps " +
+                         "(browsers) can still see it until it is reconnected once");
+            }
+            return;
+        }
 
         var svc = Drivers.Query(Drivers.HidHideService);
         string hint = HidHideHint(_hidHide.LastError, svc);
@@ -187,7 +217,7 @@ internal sealed class ControllerSession : IDisposable
 
     private static string HidHideHint(string? err, DriverState svc)
     {
-        if (!svc.Installed) return "HidHide is not installed (HidHideMSI_x64.msi); reboot after installing.";
+        if (!svc.Installed) return "HidHide is not installed; reboot after installing.";
         if (!svc.Running) return "HidHide service is stopped ('sc start HidHide' or reboot).";
         string blob = (err ?? "").ToLowerInvariant();
         if (blob.Contains("no other process") || blob.Contains("driveraccessfailed"))
@@ -256,6 +286,85 @@ internal sealed class ControllerSession : IDisposable
             Log.Warn($"[{ShortId}] no rumble handle - input-only");
     }
 
+    private void OpenRawHidReaderStep()
+    {
+        var dev = DeviceList.Local.GetHidDevices().FirstOrDefault(
+            d => string.Equals(d.DevicePath, _unit.HidDevicePath, StringComparison.OrdinalIgnoreCase));
+        if (dev is null)
+            throw new SessionStartException("Raw-HID input device not found for this unit.");
+        if (!dev.TryOpen(out _hidReader))
+            throw new SessionStartException("Could not open the raw-HID input device (in use, or blocked by HidHide).");
+
+        _hidReader.ReadTimeout = 1000;   // so the read loop notices _stop while the pad is idle
+        Log.Info($"[{ShortId}] raw HID input stream open");
+    }
+
+    // Event-driven input for send-on-change pads (Bluetooth phone gamepads): block on a HID
+    // read, parse the report, push it. No polling, so no DIERR_INPUTLOST on an idle link.
+    private void RawHidReadThread()
+    {
+        int errStreak = 0;
+        while (!_stop)
+        {
+            int n;
+            try { n = _hidReader!.Read(_rxInput, 0, _rxInput.Length); }
+            catch (TimeoutException) { continue; }
+            catch (Exception ex)
+            {
+                errStreak++;
+                if (errStreak is 1 or 10) Log.Warn($"[{ShortId}] raw HID read error #{errStreak}: {ex.GetType().Name}: {ex.Message}");
+                if (errStreak >= 40) { Fault("Raw-HID input device stopped responding.", rebuild: true); return; }
+                if (!ReopenRawHid()) Thread.Sleep(500);
+                continue;
+            }
+
+            errStreak = 0;
+            int off = n - 6;                        // HidSharp prepends the (0) report-id byte
+            if (off < 0) continue;
+
+            ParseBtDinputReport(_rxInput.AsSpan(off, 6));
+            _mapper.Map(_state, ref _xb);
+            PushToPad();
+            try { _pad!.SubmitReport(); } catch (Exception ex) { Log.Warn($"[{ShortId}] SubmitReport: {ex.Message}"); }
+        }
+    }
+
+    private bool ReopenRawHid()
+    {
+        try { _hidReader?.Dispose(); } catch { }
+        _hidReader = null;
+        try
+        {
+            var dev = DeviceList.Local.GetHidDevices().FirstOrDefault(
+                d => string.Equals(d.DevicePath, _unit.HidDevicePath, StringComparison.OrdinalIgnoreCase));
+            if (dev is null) { Log.Info($"[{ShortId}] raw HID reopen: device not present"); return false; }
+            if (!dev.TryOpen(out _hidReader)) { Log.Warn($"[{ShortId}] raw HID reopen: open failed"); return false; }
+            _hidReader.ReadTimeout = 1000;
+            Log.Info($"[{ShortId}] raw HID input stream reopened");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[{ShortId}] raw HID reopen: {ex.Message}");
+            return false;
+        }
+    }
+
+    // BluetoothPad DInput mode: 6-byte report [btn0-7][btn8-15][LX][LY][RX][RY], axes signed -127..127.
+    private void ParseBtDinputReport(ReadOnlySpan<byte> r)
+    {
+        int bits = r[0] | (r[1] << 8);
+        var btn = _state.Buttons;
+        for (int i = 0; i < 16 && i < btn.Length; i++) btn[i] = (bits & (1 << i)) != 0;
+
+        _state.X = AxisS8(r[2]);
+        _state.Y = AxisS8(r[3]);
+        _state.Z = AxisS8(r[4]);
+        _state.RotationX = AxisS8(r[5]);
+    }
+
+    private static int AxisS8(byte b) => ((sbyte)b + 127) * 65535 / 254;   // -127..127 -> 0..65535
+
     private void VirtualPadStep()
     {
         try
@@ -289,10 +398,6 @@ internal sealed class ControllerSession : IDisposable
         if (_cloaked && _unit.HidHideInstancePath is { } p)
             _hidHide.HideDevice(p);
     }
-
-    // Called before Dispose when rebuilding for the same physical slot, so the device does
-    // not flash visible between teardown and the rebuilt session re-cloaking.
-    public void KeepCloakOnDispose() => _keepCloak = true;
 
     // Poll thread only - single-threads all raw HID access.
     private void ServiceRumble(long nowMs)
@@ -372,16 +477,20 @@ internal sealed class ControllerSession : IDisposable
             }
             catch (Exception ex)
             {
+                bool transient = IsTransientInputError(ex);
                 errStreak++;
-                if (errStreak is 1 or 10 || errStreak % 60 == 0)
-                    Log.Warn($"[{ShortId}] poll error #{errStreak}: {ex.Message}");
+                if (errStreak is 1 or 10 || errStreak % 120 == 0)
+                    Log.Warn($"[{ShortId}] poll error #{errStreak}{(transient ? " (transient)" : "")}: {ex.Message}");
 
                 TryReacquire();
 
-                // Re-acquire and keep going for a transient loss; if it can't recover within ~2
-                // attach checks, fault so the manager rebuilds the session.
-                if (errStreak >= _cfg.PollErrorsBeforeAttachCheck &&
-                    Environment.TickCount64 - _lastAttachCheck > 2000)
+                // A flaky link (Bluetooth especially) throws read faults for seconds at a time
+                // without the device being gone - only escalate to fault on sustained failure.
+                int escalateAfter = transient
+                    ? Math.Max(_cfg.PollErrorsBeforeAttachCheck * 10, 200)
+                    : _cfg.PollErrorsBeforeAttachCheck;
+
+                if (errStreak >= escalateAfter && Environment.TickCount64 - _lastAttachCheck > 2000)
                 {
                     _lastAttachCheck = Environment.TickCount64;
                     if (!DevicePairer.IsAttached(InstanceGuid))
@@ -396,13 +505,18 @@ internal sealed class ControllerSession : IDisposable
                     }
                     Log.Warn($"[{ShortId}] poll errors persist ({errStreak}), device still attached - one more retry window");
                 }
-                Thread.Sleep(50);
+                Thread.Sleep(transient ? 15 : 50);
                 continue;
             }
 
             SleepToTarget(sw, loopStart);
         }
     }
+
+    // ERROR_READ_FAULT (0x8007001E / DIERR_INPUTLOST) and ERROR_INVALID_ACCESS
+    // (0x8007000C / DIERR_NOTACQUIRED) - a link hiccup, not the device leaving.
+    private static bool IsTransientInputError(Exception ex) =>
+        ex.HResult is unchecked((int)0x8007001E) or unchecked((int)0x8007000C);
 
     // Recovers a device that blinked out and came back under the same InstanceGuid.
     private void TryReacquire()
@@ -512,6 +626,7 @@ internal sealed class ControllerSession : IDisposable
     {
         Safe("rumble stop", () => { if (_rumble is { IsInvalid: false }) SendPayload(0xF3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00); });
         Safe("rumble handle", () => { _rumble?.Dispose(); _rumble = null; });
+        Safe("hid reader", () => { _hidReader?.Dispose(); _hidReader = null; });
 
         Safe("pad unsubscribe", () => { if (_pad is not null) _pad.FeedbackReceived -= OnFeedbackReceived; });
         Safe("pad reset", () => { if (_pad is not null) { _pad.ResetReport(); _pad.SubmitReport(); } });
@@ -521,11 +636,6 @@ internal sealed class ControllerSession : IDisposable
         Safe("device unacquire", () => _dev?.Unacquire());
         Safe("device dispose", () => { _dev?.Dispose(); _dev = null; });
         Safe("dinput dispose", () => { _di?.Dispose(); _di = null; });
-
-        if (_cloaked && !_keepCloak && _unit.HidHideInstancePath is not null)
-            Safe("hidhide unhide", () => { _hidHide.UnhideDevice(_unit.HidHideInstancePath); _cloaked = false; });
-        else if (_cloaked && _keepCloak)
-            Log.Info($"[{ShortId}] HidHide cloak kept across rebuild");
     }
 
     private void Safe(string what, Action a)

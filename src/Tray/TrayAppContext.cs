@@ -18,15 +18,12 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private readonly HidHideManager _hidHide;
     private readonly SessionManager _manager;
-    private readonly string _ownExe;
 
     private readonly Dictionary<ManagerStatus, (Icon icon, IntPtr handle)> _icons = new();
     private int _cleaned;
 
-    public TrayAppContext(AppConfig cfg, MappingProfile map, string ownExe)
+    public TrayAppContext(AppConfig cfg, string ownExe)
     {
-        _ownExe = ownExe;
-
         _msg = new MessageWindow(OnDeviceChange);
         _msgHwnd = _msg.Handle; // force creation on the UI thread; value is stable
 
@@ -49,8 +46,8 @@ internal sealed class TrayAppContext : ApplicationContext
             ContextMenuStrip = menu,
         };
 
-        _hidHide = new HidHideManager();
-        _manager = new SessionManager(cfg, map, _hidHide, ownExe, () => _msgHwnd)
+        _hidHide = new HidHideManager(cfg.Devices);
+        _manager = new SessionManager(cfg, _hidHide, ownExe, () => _msgHwnd)
         {
             Notify = (title, body, isError) => ShowBalloon(title, body, isError ? ToolTipIcon.Error : ToolTipIcon.Info),
         };
@@ -61,9 +58,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         PreflightDriverChecks();
 
-        // Get on HidHide's allow-list and clear any stale cloak from a crashed run, so we
-        // can see our own devices; sessions re-hide as they start.
-        try { _hidHide.StartupReset(ownExe); } catch (Exception ex) { Log.Warn("StartupReset: " + ex.Message); }
+        try { _hidHide.RegisterApp(ownExe); } catch (Exception ex) { Log.Warn("RegisterApp: " + ex.Message); }
 
         _manager.Start();
         UpdateTrayFromState(_manager.CurrentState());
@@ -213,9 +208,6 @@ internal sealed class TrayAppContext : ApplicationContext
 
         try { _manager.DisposeAll(); }
         catch (Exception ex) { Log.Error("cleanup: SessionManager.DisposeAll", ex); }
-
-        try { _hidHide.GlobalUncloak(_ownExe, Array.Empty<string>(), unregisterApp: false); }
-        catch (Exception ex) { Log.Error("cleanup: GlobalUncloak", ex); }
 
         try { NativeMethods.timeEndPeriod(1); } catch { }
 

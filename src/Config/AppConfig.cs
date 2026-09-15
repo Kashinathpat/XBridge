@@ -1,13 +1,41 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using XBridge.Diagnostics;
 
 namespace XBridge.Config;
 
+// A controller to bridge, by USB VID/PID as 4-hex-digit strings ("0079", "038f").
+internal sealed class DeviceId
+{
+    public string Vid { get; set; } = "";
+    public string Pid { get; set; } = "";
+    // "dinput" (default) or "rawhid" - the latter reads HID input reports directly, for pads
+    // that only send on change (Bluetooth phone gamepads) and choke DirectInput polling.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Input { get; set; }
+
+    public DeviceId() { }
+    public DeviceId(string vid, string pid) { Vid = vid; Pid = pid; }
+
+    [JsonIgnore] public bool RawHid => string.Equals(Input?.Trim(), "rawhid", StringComparison.OrdinalIgnoreCase);
+    [JsonIgnore] public bool IsValid => TryHex(Vid, out _) && TryHex(Pid, out _);
+    [JsonIgnore] public ushort VidValue => TryHex(Vid, out var v) ? v : (ushort)0;
+    [JsonIgnore] public ushort PidValue => TryHex(Pid, out var v) ? v : (ushort)0;
+
+    public bool Matches(ushort vid, ushort pid) => IsValid && VidValue == vid && PidValue == pid;
+
+    private static bool TryHex(string? s, out ushort value) =>
+        ushort.TryParse((s ?? "").Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
+}
+
 // Runtime knobs, persisted to %LocalAppData%\XBridge\config.json and
 // rewritten with defaults on load so new keys appear in the user's file.
 internal sealed class AppConfig
 {
+    // controllers to bridge, by USB VID/PID (4 hex digits). Add an entry per new pad.
+    public List<DeviceId> Devices { get; set; } = new() { new DeviceId("0079", "0006"), new DeviceId("038F", "1200") };
+
     // per-session poll target, ms (4-8 typical)
     public int PollIntervalMs { get; set; } = 5;
     // busy-spin the last ~1ms for lower jitter (burns a core per controller)
@@ -120,6 +148,9 @@ internal sealed class AppConfig
 
     private void Clamp()
     {
+        Devices = (Devices ?? new()).Where(d => d.IsValid).ToList();
+        if (Devices.Count == 0) { Devices.Add(new DeviceId("0079", "0006")); Devices.Add(new DeviceId("038F", "1200")); }
+
         PollIntervalMs = Math.Clamp(PollIntervalMs, 1, 33);
         JitterWarnMs = Math.Clamp(JitterWarnMs, 1.0, 1000.0);
         LeftStickDeadzone = Math.Clamp(LeftStickDeadzone, 0, 0.9);

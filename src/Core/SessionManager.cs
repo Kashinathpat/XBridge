@@ -23,10 +23,11 @@ internal sealed class SessionManager
     private readonly Dictionary<string, int> _missingPasses = new();
     private readonly Dictionary<Guid, int> _unpairedPasses = new();   // pre-pairing retry counter - guid is all we have
     private readonly HashSet<string> _warnedTransient = new();
+    private readonly HashSet<string> _warnedRawInput = new();
+    private readonly Dictionary<(ushort vid, ushort pid), InputMapper> _mappers = new();
     private DateTime _lastCloakReassert = DateTime.MinValue;
 
     private readonly AppConfig _cfg;
-    private readonly InputMapper _mapper;
     private readonly HidHideManager _hidHide;
     private readonly string _ownExe;
     private readonly Func<IntPtr> _hwndProvider;
@@ -45,13 +46,20 @@ internal sealed class SessionManager
     public event Action<ManagerState>? StateChanged;
     public Action<string, string, bool>? Notify { get; set; }   // title, body, isError -> tray balloon
 
-    public SessionManager(AppConfig cfg, MappingProfile map, HidHideManager hidHide, string ownExe, Func<IntPtr> hwndProvider)
+    public SessionManager(AppConfig cfg, HidHideManager hidHide, string ownExe, Func<IntPtr> hwndProvider)
     {
         _cfg = cfg;
-        _mapper = new InputMapper(map, cfg);
         _hidHide = hidHide;
         _ownExe = ownExe;
         _hwndProvider = hwndProvider;
+    }
+
+    // One InputMapper (and mapping file) per VID/PID - different controller layouts differ.
+    private InputMapper MapperFor(ushort vid, ushort pid)
+    {
+        if (!_mappers.TryGetValue((vid, pid), out var m))
+            _mappers[(vid, pid)] = m = new InputMapper(MappingProfile.LoadOrDefault(vid, pid), _cfg);
+        return m;
     }
 
     public void Start()
@@ -120,16 +128,16 @@ internal sealed class SessionManager
     // Stable per-slot identity: the HID device path (USB-port derived). Falls back to the DI
     // guid only for a not-yet-paired unit, which has no HID path.
     private static string KeyOf(GamepadUnit u) =>
-        u.HasRumblePath ? u.HidDevicePath!.Trim().ToLowerInvariant() : "di:" + u.DiInstanceGuid;
+        u.HasHidPath ? u.HidDevicePath!.Trim().ToLowerInvariant() : "di:" + u.DiInstanceGuid;
 
     private void ReconcileOnce(string trigger)
     {
-        var present = DevicePairer.Enumerate();
+        var present = DevicePairer.Enumerate(_cfg.Devices);
         var presentByKey = new Dictionary<string, GamepadUnit>();
         foreach (var u in present) presentByKey[KeyOf(u)] = u;
 
-        // A totally-empty enumeration while sessions are running is almost always a DI
-        // hot-plug hiccup - a faulted session still gets cleaned, absent ones do not.
+        // A totally-empty enumeration while sessions are running is almost always an
+        // enumeration hiccup - a faulted session still gets cleaned, absent ones do not.
         bool enumSuspect = present.Count == 0 && _sessions.Count > 0;
         if (enumSuspect)
             Log.Warn($"Reconcile({trigger}): enumeration returned 0 devices but {_sessions.Count} session(s) live - treating as a hiccup");
@@ -144,7 +152,7 @@ internal sealed class SessionManager
             {
                 bool rebuild = session.RebuildRequested;
                 Log.Info($"Reconcile({trigger}): tearing down {sid} - faulted: {session.FaultReason}");
-                RemoveSession(key, session, keepCloak: rebuild);
+                RemoveSession(key, session);
                 if (!rebuild && !listedAbsent)
                     _cooldownUntil[key] = DateTime.UtcNow.AddSeconds(_cfg.FaultCooldownSeconds);
                 continue;
@@ -163,13 +171,13 @@ internal sealed class SessionManager
                 // reshuffles them among identical pads) - the session's DI handle is now stale.
                 if (unit!.DiInstanceGuid != session.InstanceGuid)
                 {
-                    Log.Info($"Reconcile({trigger}): {sid} DI identity changed -> {Short(unit.DiInstanceGuid)} - rebuilding, cloak kept");
-                    RemoveSession(key, session, keepCloak: true);
+                    Log.Info($"Reconcile({trigger}): {sid} DI identity changed -> {Short(unit.DiInstanceGuid)} - rebuilding");
+                    RemoveSession(key, session);
                 }
                 continue;
             }
 
-            // Absent from enumeration - a few consecutive misses before tearing down (DI enum is racy).
+            // Absent from enumeration - a few consecutive misses before tearing down (enum can be racy).
             int n = _missingPasses[key] = _missingPasses.GetValueOrDefault(key) + 1;
             if (n < _cfg.AbsenceGracePasses)
             {
@@ -223,13 +231,18 @@ internal sealed class SessionManager
                 _unpairedPasses.Remove(guid);
             }
 
-            var session = new ControllerSession(unit, _hwndProvider(), _client!, _mapper, _cfg, _hidHide, _ownExe, OnSessionFaulted);
+            var session = new ControllerSession(unit, _hwndProvider(), _client!, MapperFor(unit.Vid, unit.Pid),
+                _cfg, _hidHide, _ownExe, OnSessionFaulted);
             try
             {
                 session.Start();
                 _sessions[key] = session;
                 _unpairedPasses.Remove(guid);
                 _warnedTransient.Remove(key);
+                if (session.RawInputVisible && _warnedRawInput.Add(key))
+                    Notify?.Invoke("Reconnect controller once",
+                        $"\"{unit.ProductName.Trim()}\" was connected before XBridge hid it, so browsers can still see it. " +
+                        "Disconnect and reconnect it once; after that it stays hidden.", false);
             }
             catch (SessionStartException ex)
             {
@@ -273,13 +286,12 @@ internal sealed class SessionManager
         RequestReconcile();
     }
 
-    private void RemoveSession(string key, ControllerSession session, bool keepCloak = false)
+    private void RemoveSession(string key, ControllerSession session)
     {
         _sessions.Remove(key);
         _missingPasses.Remove(key);
         _warnedTransient.Remove(key);
         _unpairedPasses.Remove(session.InstanceGuid);
-        if (keepCloak) session.KeepCloakOnDispose();
         try { session.Dispose(); }
         catch (Exception ex) { Log.Error($"Reconcile: dispose of {Short(session.InstanceGuid)} threw", ex); }
     }

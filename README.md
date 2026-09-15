@@ -1,21 +1,31 @@
 # XBridge
 
-A Windows system-tray app (.NET 8) that turns up to **four** wired DragonRise
-gamepads (**USB VID 0079 / PID 0006**, sold as Speedlink Strike and similar) into
-virtual **Xbox 360** controllers with working **rumble**, and hides the physical
-pads from every other app via **HidHide** so games see only the Xbox pad.
+A Windows system-tray app (.NET 8) that turns up to **four** gamepads into virtual
+**Xbox 360** controllers, and hides the physical pads from every other app via
+**HidHide** so games see only the Xbox pad. Which controllers it bridges is set by
+a VID/PID list in `config.json` (the wired DragonRise pad — USB VID 0079 / PID
+0006, sold as Speedlink Strike — is enabled by default).
 
 It has no window — it lives in the notification area. The tray icon shows state:
 **grey** = no controllers, **green** = N active, **red** = an error.
 
 ## What it does
 
-- Detects each connected VID 0079 / PID 0006 pad and exposes one virtual Xbox 360
-  controller for it (ViGEmBus).
-- Routes rumble back to the correct physical pad, as raw HID — the gamepad itself
-  needs no driver.
+- Reads each connected pad in the `config.json` `Devices` list via DirectInput and
+  exposes one virtual Xbox 360 controller for it (ViGEmBus). A pad flagged
+  `Input:"rawhid"` (e.g. a Bluetooth phone gamepad that only sends a report on
+  change, which starves DirectInput polling) is read through its raw HID reports
+  instead.
+- Each pad layout is mapped via its own `mapping-<vid>-<pid>.json`, filled in once
+  with `--calibrate`.
+- Rumble: the DragonRise pad gets it via a raw-HID output report. Anything without
+  a resolvable raw-HID path runs input-only.
 - Hides each physical pad from other applications (HidHide), so a game binds to
-  the Xbox pad only and never sees a double input.
+  the Xbox pad only and never sees a double input. The hide is permanent (it stays
+  when XBridge exits) because Windows decides at connect time whether RawInput
+  apps such as browsers can see a device — a pad that was connected before it was
+  hidden stays visible to them until it is reconnected once; XBridge tells you when
+  that is the case. Use `--hidhide-cleanup` to un-hide everything.
 - Handles hot-plug: connect / disconnect / replug / a different USB port / sleep
   and resume, without disturbing the pads that stay connected.
 - Runs as a standard user — no elevation, no UAC prompt. Only the installer needs
@@ -40,13 +50,13 @@ reboot, or unplug/replug of the pad).
 ## Use
 
 Start it from the Start menu (or it starts itself at next sign-in). The tray menu
-has: re-scan controllers, open the log / config folder, exit.
+has: open the config / log folder, exit.
 
 Command-line options (framework-dependent build — `XBridge.exe <flag>`):
 
 | flag | purpose |
 |---|---|
-| `--calibrate [--index N \| --guid <g>]` | print raw button / axis / POV indices while you press controls; fills `mapping.json` |
+| `--calibrate [--index N \| --guid <g>]` | print raw button / axis / POV indices while you press controls, to fill in a pad's mapping file |
 | `--hidhide-cleanup` | un-hide the pads, remove this exe from HidHide, disable the cloak, exit |
 | `--help` | usage |
 
@@ -56,20 +66,21 @@ Command-line options (framework-dependent build — `XBridge.exe <flag>`):
 
 | key | default | meaning |
 |---|---|---|
-| `PollIntervalMs` | 5 | per-pad poll target |
+| `Devices` | `[{Vid:"0079",Pid:"0006"}]` | which controllers to bridge, by USB VID/PID (4 hex digits). Add `Input:"rawhid"` to an entry for a pad that only sends a report on change (e.g. a Bluetooth phone gamepad). |
+| `PollIntervalMs` | 5 | how often each pad's state is pushed to its virtual pad |
 | `LeftStickDeadzone` / `RightStickDeadzone` | 0.12 | radial dead zone, fraction of full range |
-| `TriggerDeadzone` | 0.06 | for `ZAxisSplit` trigger mode |
+| `TriggerDeadzone` | 0.06 | analog-trigger dead zone |
 | `RequireCloak` | true | don't expose a virtual pad unless the physical one was hidden |
-| `RequireHidPairing` | true | don't start a pad unless its rumble HID device was found |
-| `DirectInputExclusive` | false | DirectInput cooperative level |
-| `RumbleRepeat` | 3 | times the rumble packet is re-sent per change (this pad needs a few to latch) |
+| `RequireHidPairing` | true | don't start a pad with no resolvable HID device (needed to cloak it) |
+| `RumbleRepeat` | 3 | times the DragonRise rumble packet is re-sent per change (it needs a few to latch) |
 | `RumbleWeak0x0AQuirk` | true | send `0x0B` when the weak value would be `0x0A` (DragonRise quirk) |
 | `LogMaxBytes` / `LogMaxFiles` | 1 MiB / 5 | rolling-log cap |
 
-`mapping.json` is one shared button/axis profile (all pads are identical). Run
-`XBridge.exe --calibrate`, press each control, and put the printed indices into
-`mapping.json` (axis convention `0=X 1=Y 2=Z 3=RotationX 4=RotationY 5=RotationZ`;
-`TriggerMode` is `"Buttons"` or `"ZAxisSplit"`). Restart the app to apply.
+Each pad layout gets its own `mapping-<vid>-<pid>.json`: run `XBridge.exe
+--calibrate` (add `--index N` or `--guid <g>` to pick which attached pad), press
+each control, and put the printed indices into that file (axis convention `0=X
+1=Y 2=Z 3=RotationX 4=RotationY 5=RotationZ`; `TriggerMode` is `"Buttons"` or
+`"ZAxisSplit"`). Restart to apply.
 
 `logs\app.log` is a rolling, size-capped log — session lifecycle, driver
 preflight, HidHide calls, poll-timing, warnings and errors.

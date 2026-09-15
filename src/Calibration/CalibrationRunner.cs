@@ -1,19 +1,18 @@
 using XBridge.Config;
-using XBridge.Core;
 using XBridge.Diagnostics;
 using XBridge.Interop;
 using Vortice.DirectInput;
 
 namespace XBridge.Calibration;
 
-// --calibrate: opens the pad non-exclusively and prints raw button/axis/POV indices
-// as controls are pressed, so mapping.json can be filled in once.
+// --calibrate: opens a pad non-exclusively and prints raw button/axis/POV indices as
+// controls are pressed, so mapping-<vid>-<pid>.json can be filled in.
 internal static class CalibrationRunner
 {
     private static volatile bool _stop;
     public static void Stop() => _stop = true;
 
-    public static void Run(string[] args)
+    public static void Run(string[] args, AppConfig cfg)
     {
         Log.EnableConsoleMirror();
         Console.WriteLine("=== XBridge : calibration ===");
@@ -24,34 +23,39 @@ internal static class CalibrationRunner
 
         IDirectInput8? di = null;
         IDirectInputDevice8? dev = null;
+        ushort cvid = 0, cpid = 0;
         try
         {
             di = DInput.DirectInput8Create();
 
-            var matches = new List<DeviceInstance>();
+            var matches = new List<(DeviceInstance inst, ushort vid, ushort pid)>();
             foreach (var d in di.GetDevices(DeviceClass.GameControl, DeviceEnumerationFlags.AttachedOnly))
             {
                 var (vid, pid) = DecodeVidPid(d.ProductGuid);
-                if (vid == HidHideManager.Vid && pid == HidHideManager.Pid)
-                    matches.Add(d);
+                if (cfg.Devices.Any(x => x.Matches(vid, pid)))
+                    matches.Add((d, vid, pid));
             }
 
             if (matches.Count == 0)
             {
-                Console.WriteLine("No matching gamepad (VID 0079 / PID 0006) is attached.");
+                Console.WriteLine("None of the config.json Devices are attached.");
                 return;
             }
 
             for (int i = 0; i < matches.Count; i++)
-                Console.WriteLine($"  [{i}] {matches[i].ProductName}   InstanceGuid={matches[i].InstanceGuid}");
+                Console.WriteLine($"  [{i}] {matches[i].inst.ProductName}  VID {matches[i].vid:X4}/PID {matches[i].pid:X4}  " +
+                                  $"InstanceGuid={matches[i].inst.InstanceGuid}");
             Console.WriteLine();
 
-            DeviceInstance chosen =
-                wantGuid != Guid.Empty ? matches.FirstOrDefault(m => m.InstanceGuid == wantGuid) ?? matches[0]
-              : wantIndex >= 0 && wantIndex < matches.Count ? matches[wantIndex]
-              : matches[0];
+            int byGuid = wantGuid != Guid.Empty ? matches.FindIndex(m => m.inst.InstanceGuid == wantGuid) : -1;
+            var pick = byGuid >= 0 ? matches[byGuid]
+                     : wantIndex >= 0 && wantIndex < matches.Count ? matches[wantIndex]
+                     : matches[0];
+            var chosen = pick.inst;
+            cvid = pick.vid;
+            cpid = pick.pid;
 
-            Console.WriteLine($"Using [{matches.IndexOf(chosen)}] {chosen.ProductName}  {chosen.InstanceGuid}");
+            Console.WriteLine($"Using [{matches.FindIndex(m => m.inst.InstanceGuid == chosen.InstanceGuid)}] {chosen.ProductName}  {chosen.InstanceGuid}");
             Console.WriteLine("(pass --index N or --guid <instance-guid> to pick another)");
             Console.WriteLine();
 
@@ -125,6 +129,7 @@ internal static class CalibrationRunner
         {
             Console.WriteLine("Calibration error: " + ex);
             Log.Error("calibration error", ex);
+            return;
         }
         finally
         {
@@ -134,15 +139,8 @@ internal static class CalibrationRunner
         }
 
         Console.WriteLine(new string('-', 64));
-        if (!File.Exists(MappingProfile.PathOnDisk))
-        {
-            new MappingProfile().Save();
-            Console.WriteLine($"Wrote a starter mapping file: {MappingProfile.PathOnDisk}");
-        }
-        else
-        {
-            Console.WriteLine($"Edit your mapping file: {MappingProfile.PathOnDisk}");
-        }
+        MappingProfile.LoadOrDefault(cvid, cpid);   // ensure the file exists
+        Console.WriteLine($"Edit your mapping file: {MappingProfile.PathFor(cvid, cpid)}");
         Console.WriteLine("Axis index convention: 0=X 1=Y 2=Z 3=RotationX 4=RotationY 5=RotationZ");
         Console.WriteLine("Set button numbers under \"Buttons\", stick axes under LeftStick/RightStick,");
         Console.WriteLine("and TriggerMode (\"Buttons\" or \"ZAxisSplit\"). Restart the app to apply.");

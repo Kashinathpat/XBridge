@@ -1,6 +1,8 @@
 using System.Management;
+using System.Text.RegularExpressions;
 using Nefarius.Drivers.HidHide;
 using Nefarius.Drivers.HidHide.Exceptions;
+using XBridge.Config;
 using XBridge.Diagnostics;
 
 namespace XBridge.Core;
@@ -11,13 +13,14 @@ internal enum HidHideAccess { Ok, NotInstalled, AccessDenied, ServiceUnavailable
 // retried if the driver is momentarily held by another API consumer (e.g. its config GUI).
 internal sealed class HidHideManager
 {
-    public const ushort Vid = 0x0079;
-    public const ushort Pid = 0x0006;
-
     private const int OpenAttempts = 6;
     private const int OpenRetryMs = 200;
 
     private readonly object _gate = new();
+    private readonly IReadOnlyList<DeviceId> _devices;
+
+    public HidHideManager(IReadOnlyList<DeviceId> devices) => _devices = devices;
+
     public string? LastError { get; private set; }
 
     // True when the last failure was "driver handle busy" (another API consumer, e.g. the
@@ -54,7 +57,7 @@ internal sealed class HidHideManager
         {
             if (!Call(s => s.IsInstalled))
             {
-                detail = "HidHide driver is not installed (HidHideMSI_x64.msi).";
+                detail = "HidHide driver is not installed.";
                 return HidHideAccess.NotInstalled;
             }
             if (!Call(s => s.IsDriverNodePresent))
@@ -113,19 +116,36 @@ internal sealed class HidHideManager
     private static string Describe(string what, Exception ex) =>
         $"{what}: {ex.GetType().Name}: {ex.Message}";
 
-    // All present "HID\VID_0079&PID_0006\..." PnP instance ids (WMI - sees cloaked devices too).
-    public static IReadOnlyList<string> EnumerateInstancePaths()
+    private static readonly Regex VidRe = new(@"VID[_&]([0-9A-Fa-f]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex PidRe = new(@"PID[_&]([0-9A-Fa-f]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Handles both "HID\VID_0079&PID_0006\..." and Bluetooth "HID\{guid}_VID&0001038F_PID&1200\...".
+    public static bool TryExtractVidPid(string instanceId, out ushort vid, out ushort pid)
+    {
+        vid = pid = 0;
+        var mv = VidRe.Match(instanceId);
+        var mp = PidRe.Match(instanceId);
+        if (!mv.Success || !mp.Success) return false;
+        vid = (ushort)(Convert.ToUInt32(mv.Groups[1].Value, 16) & 0xFFFF);
+        pid = (ushort)(Convert.ToUInt32(mp.Groups[1].Value, 16) & 0xFFFF);
+        return true;
+    }
+
+    // Present HID PnP instance ids for the configured devices (WMI - sees cloaked devices too).
+    public static IReadOnlyList<string> EnumerateInstancePaths(IReadOnlyList<DeviceId> devices)
     {
         var list = new List<string>();
-        string like = $"HID\\\\VID_{Vid:X4}&PID_{Pid:X4}%";
         try
         {
             using var searcher = new ManagementObjectSearcher(
-                "root\\CIMV2", $"SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE '{like}'");
+                "root\\CIMV2", "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE 'HID\\\\%'");
             using var results = searcher.Get();
             foreach (ManagementBaseObject mo in results)
             {
-                if (mo["DeviceID"] is string id && id.Length > 0) list.Add(id);
+                if (mo["DeviceID"] is string id && id.Length > 0
+                    && TryExtractVidPid(id, out var v, out var p)
+                    && devices.Any(d => d.Matches(v, p)))
+                    list.Add(id);
                 mo.Dispose();
             }
         }
@@ -137,16 +157,13 @@ internal sealed class HidHideManager
         return list;
     }
 
+    // Blocks are deliberately never removed while the app runs or exits: the kernel decides at
+    // device arrival whether RawInput apps (browsers) can see a device, and only an already-
+    // blocked device is excluded. Only --cloak-off / the uninstaller clear them.
     public bool HideDevice(string instanceId) => Mutate("hide " + Short(instanceId), s =>
     {
         if (!s.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
             s.AddBlockedInstanceId(instanceId);
-    });
-
-    public bool UnhideDevice(string instanceId) => Mutate("unhide " + Short(instanceId), s =>
-    {
-        if (s.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
-            s.RemoveBlockedInstanceId(instanceId);
     });
 
     // Bring one device fully under HidHide: allow-list this exe, block the device, enable hiding.
@@ -159,45 +176,29 @@ internal sealed class HidHideManager
         if (!s.IsActive) s.IsActive = true;
     });
 
-    // Put this exe on HidHide's application allow-list (installer one-shot, runs elevated).
+    // Put this exe on HidHide's application allow-list.
     public bool RegisterApp(string exePath) => Mutate("register app", s =>
     {
         if (!s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
             s.AddApplicationPath(exePath, false);
     });
 
-    // Startup: allow-list this exe and drop any stale blocks for our device family
-    // (a crashed run can leave them) - sessions re-block as they start.
-    public void StartupReset(string exePath) => Mutate("startup reset", s =>
+    // --cloak-off / uninstall: unblock our devices, unregister this exe, and drop global
+    // hiding only if nobody else is blocking anything.
+    public void GlobalUncloak(string exePath) => Mutate("global uncloak", s =>
     {
-        if (!s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
-            s.AddApplicationPath(exePath, false);
         foreach (var id in s.BlockedInstanceIds.Where(IsOurs).ToList())
             s.RemoveBlockedInstanceId(id);
+
+        if (s.BlockedInstanceIds.Count == 0 && s.IsActive)
+            s.IsActive = false;
+
+        if (s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
+            s.RemoveApplicationPath(exePath);
     });
 
-    // Unblock our devices; drop global hiding only if nobody else is blocking anything.
-    // unregisterApp is uninstall-only - a normal exit keeps this exe on the allow-list.
-    public void GlobalUncloak(string exePath, IEnumerable<string> knownInstanceIds, bool unregisterApp) =>
-        Mutate(unregisterApp ? "global uncloak (+unreg)" : "shutdown uncloak", s =>
-        {
-            var mine = knownInstanceIds
-                .Concat(s.BlockedInstanceIds.Where(IsOurs))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            foreach (var id in mine)
-                if (s.BlockedInstanceIds.Contains(id, StringComparer.OrdinalIgnoreCase))
-                    s.RemoveBlockedInstanceId(id);
-
-            if (s.BlockedInstanceIds.Count == 0 && s.IsActive)
-                s.IsActive = false;
-
-            if (unregisterApp && s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
-                s.RemoveApplicationPath(exePath);
-        });
-
-    private static bool IsOurs(string instanceId) =>
-        instanceId.Contains($"VID_{Vid:X4}&PID_{Pid:X4}", StringComparison.OrdinalIgnoreCase);
+    private bool IsOurs(string instanceId) =>
+        TryExtractVidPid(instanceId, out var v, out var p) && _devices.Any(d => d.Matches(v, p));
 
     private bool Mutate(string what, Action<IHidHideControlService> act)
     {

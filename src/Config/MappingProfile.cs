@@ -3,7 +3,7 @@ using XBridge.Diagnostics;
 
 namespace XBridge.Config;
 
-// Physical-pad -> Xbox 360 layout, one profile shared by every session (identical hardware).
+// Physical-pad -> Xbox 360 layout, one file per VID/PID (mapping-<vid>-<pid>.json).
 // Axis index: 0=X 1=Y 2=Z 3=RotationX 4=RotationY 5=RotationZ. Button index: raw DInput number.
 internal sealed class MappingProfile
 {
@@ -61,43 +61,75 @@ internal sealed class MappingProfile
         AllowTrailingCommas = true,
     };
 
-    public static string PathOnDisk => Path.Combine(AppConfig.ConfigDir, "mapping.json");
+    public static string PathFor(ushort vid, ushort pid) =>
+        Path.Combine(AppConfig.ConfigDir, $"mapping-{vid:x4}-{pid:x4}.json");
 
-    public static MappingProfile LoadOrDefault()
+    public static MappingProfile LoadOrDefault(ushort vid, ushort pid)
     {
+        string path = PathFor(vid, pid);
+
+        // one-time migration of the old single mapping.json to the DragonRise profile
+        string legacy = Path.Combine(AppConfig.ConfigDir, "mapping.json");
+        if (!File.Exists(path) && File.Exists(legacy) && vid == 0x0079 && pid == 0x0006)
+            try { File.Copy(legacy, path); Log.Info($"Migrated mapping.json -> {Path.GetFileName(path)}"); } catch { }
+
         try
         {
-            if (File.Exists(PathOnDisk))
+            if (File.Exists(path))
             {
-                var p = JsonSerializer.Deserialize<MappingProfile>(File.ReadAllText(PathOnDisk), JsonOpts);
-                if (p is not null)
-                {
-                    Log.Info($"Mapping profile loaded from {PathOnDisk}");
-                    return p;
-                }
+                var p = JsonSerializer.Deserialize<MappingProfile>(File.ReadAllText(path), JsonOpts);
+                if (p is not null) { Log.Info($"Mapping loaded from {Path.GetFileName(path)}"); return p; }
             }
         }
         catch (Exception ex)
         {
-            Log.Error("Mapping load failed - using defaults", ex);
+            Log.Error($"Mapping load failed for {Path.GetFileName(path)} - using defaults", ex);
         }
 
-        var def = new MappingProfile();
-        def.Save();
-        Log.Info($"Mapping profile created with defaults at {PathOnDisk} (run --calibrate to tune it)");
+        var def = Default(vid, pid);
+        def.Save(vid, pid);
+        Log.Info($"Mapping created with defaults at {Path.GetFileName(path)} (run --calibrate to tune it)");
         return def;
     }
 
-    public void Save()
+    public void Save(ushort vid, ushort pid)
     {
         try
         {
             Directory.CreateDirectory(AppConfig.ConfigDir);
-            File.WriteAllText(PathOnDisk, JsonSerializer.Serialize(this, JsonOpts));
+            File.WriteAllText(PathFor(vid, pid), JsonSerializer.Serialize(this, JsonOpts));
         }
         catch (Exception ex)
         {
             Log.Error("Mapping save failed", ex);
         }
+    }
+
+    // Starting point per known layout - always verify with --calibrate.
+    private static MappingProfile Default(ushort vid, ushort pid)
+    {
+        // "Bluetooth Gamepad" (VID 038F / PID 1200): X/Y/Z/Rx, 16 buttons, no hat, no rumble.
+        if (vid == 0x038F && pid == 0x1200)
+            return new MappingProfile
+            {
+                LeftStick = new() { XAxis = 0, YAxis = 1 },
+                RightStick = new() { XAxis = 2, YAxis = 3 },
+                TriggerMode = "Buttons",
+                LeftTriggerButton = 6,
+                RightTriggerButton = 7,
+                DpadFromPov = false,
+                DpadUpButton = 12,
+                DpadDownButton = 13,
+                DpadLeftButton = 14,
+                DpadRightButton = 15,
+                Buttons = new()
+                {
+                    A = 0, B = 1, X = 2, Y = 3,
+                    LeftShoulder = 4, RightShoulder = 5,
+                    Back = 8, Start = 9, LeftThumb = 10, RightThumb = 11, Guide = -1,
+                },
+            };
+
+        return new MappingProfile();   // DragonRise defaults (the field initializers)
     }
 }

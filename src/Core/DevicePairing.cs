@@ -1,21 +1,26 @@
 using HidSharp;
+using XBridge.Config;
 using XBridge.Diagnostics;
 using Vortice.DirectInput;
 
 namespace XBridge.Core;
 
-// One physical gamepad with both halves resolved: DirectInput (input) + raw HID (rumble) + PnP
-// instance path (HidHide cloak). MatchKind is "exact" | "positional" | "none".
+// One physical gamepad with both halves resolved: DirectInput (input) + raw HID + PnP instance
+// path (HidHide cloak). MatchKind is "exact" | "positional" | "none".
 internal sealed record GamepadUnit(
     Guid DiInstanceGuid,
+    ushort Vid,
+    ushort Pid,
     string ProductName,
     string DiInterfacePath,
     string? HidDevicePath,
     int HidMaxOutputLength,
     string? HidHideInstancePath,
-    string MatchKind)
+    string MatchKind,
+    bool RawHidInput)
 {
-    public bool HasRumblePath => !string.IsNullOrEmpty(HidDevicePath);
+    // A paired raw HID device exists (used for the stable session key), regardless of rumble.
+    public bool HasHidPath => !string.IsNullOrEmpty(HidDevicePath);
     public string Short => DiInstanceGuid.ToString()[..8];
 }
 
@@ -23,25 +28,22 @@ internal sealed record GamepadUnit(
 // positional pairing when identical units make that path ambiguous.
 internal static class DevicePairer
 {
-    public const ushort Vid = 0x0079;
-    public const ushort Pid = 0x0006;
-
     private static string _lastSignature = "";   // so the per-unit line isn't logged on every re-scan
 
-    public static List<GamepadUnit> Enumerate()
+    public static List<GamepadUnit> Enumerate(IReadOnlyList<DeviceId> devices)
     {
-        var diList = EnumerateDirectInput();
-        var hidList = EnumerateHid();
-        var pnpIds = HidHideManager.EnumerateInstancePaths().ToList();
+        var diList = EnumerateDirectInput(devices);
+        var hidList = EnumerateHid(devices);
+        var pnpIds = HidHideManager.EnumerateInstancePaths(devices).ToList();
 
         // Exact 1:1 on interface path (DIPROP_GUIDANDPATH <-> HidDevice.DevicePath).
         var exact = new Dictionary<Guid, HidDevice>();
-        foreach (var (guid, _, ifacePath) in diList)
+        foreach (var d in diList)
         {
-            string n = Normalize(ifacePath);
+            string n = Normalize(d.ifacePath);
             if (n.Length == 0) continue;
             var hid = hidList.FirstOrDefault(h => Normalize(h.DevicePath) == n);
-            if (hid is not null) exact[guid] = hid;
+            if (hid is not null) exact[d.guid] = hid;
         }
 
         bool distinct = exact.Values.Select(h => h.DevicePath)
@@ -73,8 +75,9 @@ internal static class DevicePairer
         var units = new List<GamepadUnit>(diList.Count);
         for (int i = 0; i < diOrdered.Count; i++)
         {
-            var (guid, name, ifacePath) = diOrdered[i];
+            var (guid, vid, pid, name, ifacePath) = diOrdered[i];
             var hid = pairing.GetValueOrDefault(guid);
+            bool rawHid = devices.FirstOrDefault(d => d.Matches(vid, pid))?.RawHid ?? false;
 
             // Derive the cloak id from the HID device path (reliable) not the DI path (may collide).
             string? cloakId = hid is not null
@@ -85,10 +88,10 @@ internal static class DevicePairer
             if (hid is null)
             {
                 Log.Error($"Pairing[{guid.ToString()[..8]}]: no raw HID device paired (name='{name.Trim()}').");
-                units.Add(new GamepadUnit(guid, name, ifacePath, null, 0, cloakId, "none"));
+                units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, null, 0, cloakId, "none", rawHid));
                 continue;
             }
-            units.Add(new GamepadUnit(guid, name, ifacePath, hid.DevicePath, hid.SafeMaxOut(), cloakId, mode));
+            units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, hid.DevicePath, hid.SafeMaxOut(), cloakId, mode, rawHid));
         }
 
         // Log the per-unit summary only when the pairing set changes (not every re-scan).
@@ -97,7 +100,7 @@ internal static class DevicePairer
         {
             _lastSignature = sig;
             foreach (var u in units)
-                Log.Info($"Pairing[{u.Short}]: {u.MatchKind}  DI='{Ellipsis(u.DiInterfacePath)}'  <->  " +
+                Log.Info($"Pairing[{u.Short}]: {u.MatchKind}  VID {u.Vid:X4}/PID {u.Pid:X4}  DI='{Ellipsis(u.DiInterfacePath)}'  <->  " +
                          $"HID='{Ellipsis(u.HidDevicePath ?? "<none>")}'  hidHide='{u.HidHideInstancePath ?? "<none>"}'  maxOut={u.HidMaxOutputLength}");
         }
         return units;
@@ -114,9 +117,10 @@ internal static class DevicePairer
 
     // Never cache DIPROP_GUIDANDPATH by guid: DirectInput reassigns InstanceGuids among
     // identical (same VID/PID, no serial) devices when the attached set changes.
-    private static List<(Guid guid, string name, string ifacePath)> EnumerateDirectInput()
+    private static List<(Guid guid, ushort vid, ushort pid, string name, string ifacePath)> EnumerateDirectInput(
+        IReadOnlyList<DeviceId> devices)
     {
-        var result = new List<(Guid, string, string)>();
+        var result = new List<(Guid, ushort, ushort, string, string)>();
 
         // DI enumeration is racy right after a USB change; on an empty result, retry once.
         for (int attempt = 0; attempt < 2 && result.Count == 0; attempt++)
@@ -129,10 +133,10 @@ internal static class DevicePairer
                 foreach (var d in di.GetDevices(DeviceClass.GameControl, DeviceEnumerationFlags.AttachedOnly))
                 {
                     var (vid, pid) = DecodeVidPid(d.ProductGuid);
-                    if (vid != Vid || pid != Pid) continue;
+                    if (!devices.Any(x => x.Matches(vid, pid))) continue;
 
-                    string name = string.IsNullOrWhiteSpace(d.ProductName) ? "USB Joystick" : d.ProductName;
-                    result.Add((d.InstanceGuid, name, ReadInterfacePath(di, d.InstanceGuid)));
+                    string name = string.IsNullOrWhiteSpace(d.ProductName) ? "Gamepad" : d.ProductName;
+                    result.Add((d.InstanceGuid, vid, pid, name, ReadInterfacePath(di, d.InstanceGuid)));
                 }
             }
             catch (Exception ex)
@@ -167,7 +171,7 @@ internal static class DevicePairer
         }
     }
 
-    private static List<HidDevice> EnumerateHid()
+    private static List<HidDevice> EnumerateHid(IReadOnlyList<DeviceId> devices)
     {
         // HidSharp can briefly return nothing while Windows re-enumerates the HID stack
         // after a sibling on the same hub/controller is unplugged - retry once.
@@ -175,7 +179,9 @@ internal static class DevicePairer
         {
             try
             {
-                var list = DeviceList.Local.GetHidDevices(Vid, Pid).ToList();
+                var list = DeviceList.Local.GetHidDevices()
+                    .Where(h => devices.Any(x => x.Matches((ushort)h.VendorID, (ushort)h.ProductID)))
+                    .ToList();
                 if (list.Count > 0 || attempt == 1) return list;
             }
             catch (Exception ex)
@@ -216,8 +222,8 @@ internal static class DevicePairer
             foreach (var seg in p.Split('#', StringSplitOptions.RemoveEmptyEntries))
             {
                 if (seg.StartsWith("{")) continue;
-                if (seg.Contains("vid_", StringComparison.OrdinalIgnoreCase) &&
-                    seg.Contains("pid_", StringComparison.OrdinalIgnoreCase)) continue;
+                if (seg.Contains("vid_", StringComparison.OrdinalIgnoreCase) ||
+                    seg.Contains("vid&", StringComparison.OrdinalIgnoreCase)) continue;
                 if (seg.Replace("\\", "").Replace("?", "").Equals("hid", StringComparison.OrdinalIgnoreCase)) continue;
                 return seg.ToLowerInvariant();
             }

@@ -47,9 +47,9 @@ internal static class Program
         try
         {
             if (HasFlag(args, "--help", "-h", "/?")) return ShowHelp();
-            if (HasFlag(args, "--cloak-off", "--hidhide-cleanup")) return HidHideCleanup();
-            if (HasFlag(args, "--hidhide-register")) return HidHideRegister();
-            if (HasFlag(args, "--calibrate")) return RunCalibrate(args);
+            if (HasFlag(args, "--cloak-off", "--hidhide-cleanup")) return HidHideCleanup(cfg);
+            if (HasFlag(args, "--hidhide-register")) return HidHideRegister(cfg);
+            if (HasFlag(args, "--calibrate")) return RunCalibrate(args, cfg);
 
             return RunTray(cfg);
         }
@@ -62,8 +62,6 @@ internal static class Program
     private static int RunTray(AppConfig cfg)
     {
         NativeMethods.timeBeginPeriod(1); // 1 ms scheduler tick for low-jitter polling
-
-        var map = MappingProfile.LoadOrDefault();
 
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -78,12 +76,12 @@ internal static class Program
             ?? System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
             ?? Path.Combine(AppContext.BaseDirectory, "XBridge.exe");
 
-        using var ctx = new TrayAppContext(cfg, map, ownExe);
+        using var ctx = new TrayAppContext(cfg, ownExe);
         Application.Run(ctx);
         return 0;
     }
 
-    private static int HidHideCleanup()
+    private static int HidHideCleanup(AppConfig cfg)
     {
         NativeMethods.AllocConsole();
         Log.EnableConsoleMirror();
@@ -92,8 +90,8 @@ internal static class Program
         string ownExe = Environment.ProcessPath ?? "XBridge.exe";
         try
         {
-            var hh = new HidHideManager();
-            hh.GlobalUncloak(ownExe, Array.Empty<string>(), unregisterApp: true);
+            var hh = new HidHideManager(cfg.Devices);
+            hh.GlobalUncloak(ownExe);
             Console.WriteLine("HidHide: devices un-hidden, this app un-registered, cloak disabled.");
             return 0;
         }
@@ -105,24 +103,24 @@ internal static class Program
         }
     }
 
-    private static int HidHideRegister()
+    private static int HidHideRegister(AppConfig cfg)
     {
         NativeMethods.AllocConsole();
         Log.EnableConsoleMirror();
         Log.Info("Running one-shot HidHide app registration (--hidhide-register).");
 
         string ownExe = Environment.ProcessPath ?? "XBridge.exe";
-        bool ok = new HidHideManager().RegisterApp(ownExe);
+        bool ok = new HidHideManager(cfg.Devices).RegisterApp(ownExe);
         Console.WriteLine(ok ? "HidHide: this app is on the allow-list." : "HidHide: registration failed (see log).");
         return ok ? 0 : 1;
     }
 
-    private static int RunCalibrate(string[] args)
+    private static int RunCalibrate(string[] args, AppConfig cfg)
     {
         NativeMethods.AllocConsole();
         try
         {
-            CalibrationRunner.Run(args);
+            CalibrationRunner.Run(args, cfg);
             Console.WriteLine();
             Console.WriteLine("Press Enter to close.");
             try { Console.ReadLine(); } catch { }
@@ -141,24 +139,25 @@ internal static class Program
         NativeMethods.AllocConsole();
         Console.WriteLine(
             """
-            XBridge - emulates Xbox 360 controllers (with rumble) from up to
-            four wired gamepads (USB VID 0079 / PID 0006) and hides the
-            physical devices from other apps via HidHide.
+            XBridge - emulates Xbox 360 controllers (with rumble) from up to four
+            DirectInput gamepads and hides the physical devices via HidHide. Which
+            controllers to bridge is set by the Devices list in config.json.
 
             Usage:
               XBridge.exe                 Run in the system tray (normal mode).
               XBridge.exe --calibrate [--index N | --guid <g>]
                                                   Print raw button/axis indices while
-                                                  you press controls; writes mapping.json.
+                                                  you press controls; writes the
+                                                  mapping file for that pad.
               XBridge.exe --cloak-off     One-shot: un-hide devices, un-register
               XBridge.exe --hidhide-cleanup   this exe, disable cloak, then exit
                                                   (used by the installer/uninstaller).
               XBridge.exe --help          This text.
 
             Files (all under %LOCALAPPDATA%\XBridge):
-              config.json     poll interval, dead zones, timing, log caps, RequireCloak
-              mapping.json    shared button/axis calibration (one profile, identical HW)
-              logs\app.log    rolling, size-capped diagnostic log
+              config.json              Devices list, poll interval, dead zones, RequireCloak
+              mapping-<vid>-<pid>.json  button/axis calibration, one file per pad layout
+              logs\app.log             rolling, size-capped diagnostic log
             """);
         Console.WriteLine();
         Console.WriteLine("Press Enter to close.");
