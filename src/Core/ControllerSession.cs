@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using HidSharp;
 using Microsoft.Win32.SafeHandles;
 using Nefarius.ViGEm.Client;
@@ -22,7 +21,7 @@ internal sealed class SessionStartException : Exception
     public bool Transient { get; init; }
 }
 
-// One physical gamepad: own DI handle (input), raw HID handle (rumble), ViGEm pad, cloak entry, poll thread.
+// One physical gamepad: raw HID read handle (input), raw HID write handle (rumble), ViGEm pad, cloak entry.
 // FeedbackReceived only stages bytes for this session's HID handle, so rumble can't cross to another unit.
 internal sealed class ControllerSession : IDisposable
 {
@@ -33,7 +32,6 @@ internal sealed class ControllerSession : IDisposable
     public bool RawInputVisible { get; private set; }
 
     private readonly GamepadUnit _unit;
-    private readonly IntPtr _coopHwnd;
     private readonly ViGEmClient _client;
     private readonly InputMapper _mapper;
     private readonly AppConfig _cfg;
@@ -44,20 +42,16 @@ internal sealed class ControllerSession : IDisposable
     private volatile SessionStatus _status = SessionStatus.Starting;
     private string ShortId => _unit.Short;
 
-    private IDirectInput8? _di;
-    private IDirectInputDevice8? _dev;
-    private CooperativeLevel _coop;
     private SafeFileHandle? _rumble;
+    private HidDevice? _hidDevice;
     private HidStream? _hidReader;
-    private readonly byte[] _rxInput = new byte[64];
+    private HidInputParser? _parser;
+    private byte[] _rxInput = Array.Empty<byte>();
     private IXbox360Controller? _pad;
     private bool _cloaked;
 
     private Thread? _thread;
     private volatile bool _stop;
-    private readonly double _targetMs;
-    private long _lastAttachCheck;
-    private int _attachCheckCount;
 
     private int _wantRumble;   // packed (strong << 8) | weak, written by the ViGEm callback
     private int _rumbleDirty;
@@ -68,29 +62,20 @@ internal sealed class ControllerSession : IDisposable
     private JoystickState _state = new();
     private XboxState _xb;
 
-    private long _lastLoopTicks;
-    private long _jitterCount;
-    private double _jitterSumMs;
-    private double _jitterMaxMs;
-    private long _lastJitterWarnMs;
-    private long _lastJitterReportMs;
-
     private int _disposed;
     private int _faultReported;
 
     public ControllerSession(
-        GamepadUnit unit, IntPtr coopHwnd, ViGEmClient client, InputMapper mapper,
+        GamepadUnit unit, ViGEmClient client, InputMapper mapper,
         AppConfig cfg, HidHideManager hidHide, string ownExe, Action<ControllerSession> onFaulted)
     {
         _unit = unit;
-        _coopHwnd = coopHwnd;
         _client = client;
         _mapper = mapper;
         _cfg = cfg;
         _hidHide = hidHide;
         _ownExe = ownExe;
         _onFaulted = onFaulted;
-        _targetMs = Math.Max(1, cfg.PollIntervalMs);
         _txBuf = new byte[Math.Max(8, unit.HidMaxOutputLength)];
     }
 
@@ -103,27 +88,14 @@ internal sealed class ControllerSession : IDisposable
             OpenRumbleHandleStep();
             CloakStep();
 
-            ThreadStart loop;
-            if (_unit.RawHidInput)
-            {
-                OpenRawHidReaderStep();
-                VirtualPadStep();
-                loop = RawHidReadThread;
-            }
-            else
-            {
-                OpenDeviceStep();
-                AcquireStep();
-                VerifyPairingStep();
-                SendIdle();
-                VirtualPadStep();   // wires FeedbackReceived only after pairing is verified
-                loop = PollThread;
-            }
+            OpenRawHidReaderStep();
+            SendIdle();
+            VirtualPadStep();
 
             _status = SessionStatus.Running;
-            _thread = new Thread(loop) { Name = $"Input-{ShortId}", IsBackground = true, Priority = ThreadPriority.AboveNormal };
+            _thread = new Thread(ReadThread) { Name = $"Input-{ShortId}", IsBackground = true, Priority = ThreadPriority.AboveNormal };
             _thread.Start();
-            Log.Info($"[{ShortId}] session RUNNING ({(_unit.RawHidInput ? "raw HID" : "DirectInput")})");
+            Log.Info($"[{ShortId}] session RUNNING");
         }
         catch (Exception ex)
         {
@@ -141,18 +113,11 @@ internal sealed class ControllerSession : IDisposable
     private void OpenRumbleHandleStep()
     {
         if (string.IsNullOrEmpty(_unit.HidDevicePath))
-        {
-            if (_cfg.RequireHidPairing)
-                throw new SessionStartException(
-                    "No raw HID device paired to this unit - rumble can't be routed. " +
-                    "Set RequireHidPairing=false in config.json for input-only.");
-            Log.Warn($"[{ShortId}] no paired HID path - input-only, rumble disabled");
-            return;
-        }
+            throw new SessionStartException("No raw HID device found for this unit.");
 
         if (_unit.HidMaxOutputLength <= 0)
         {
-            Log.Info($"[{ShortId}] paired HID device has no output report - input-only (this device can't rumble)");
+            Log.Info($"[{ShortId}] HID device has no output report - input-only (this device can't rumble)");
             return;
         }
 
@@ -165,9 +130,7 @@ internal sealed class ControllerSession : IDisposable
 
         _rumble?.Dispose();
         _rumble = null;
-        string msg = $"Could not open the paired raw HID handle for rumble: {err ?? "unknown error"}";
-        if (_cfg.RequireHidPairing) throw new SessionStartException(msg);
-        Log.Warn($"[{ShortId}] {msg} - input-only");
+        Log.Warn($"[{ShortId}] could not open the rumble HID handle ({err ?? "unknown error"}) - input-only");
     }
 
     private void CloakStep()
@@ -227,90 +190,51 @@ internal sealed class ControllerSession : IDisposable
         return "See the HidHide error in the log.";
     }
 
-    private void OpenDeviceStep()
-    {
-        try
-        {
-            _di = DInput.DirectInput8Create();
-            _dev = _di.CreateDevice(InstanceGuid);
-            _dev.SetDataFormat<RawJoystickState>().CheckError();
-            _coop = (_cfg.DirectInputExclusive ? CooperativeLevel.Exclusive : CooperativeLevel.NonExclusive)
-                    | CooperativeLevel.Background;
-            _dev.SetCooperativeLevel(_coopHwnd, _coop).CheckError();
-        }
-        catch (Exception ex)
-        {
-            throw new SessionStartException("Failed to open the DirectInput device: " + ex.Message, ex);
-        }
-    }
-
-    private void AcquireStep()
-    {
-        for (int attempt = 0; ; attempt++)
-        {
-            try
-            {
-                _dev!.Acquire().CheckError();
-                if (attempt > 0) Log.Info($"[{ShortId}] acquired on attempt {attempt + 1}");
-                return;
-            }
-            catch (Exception ex)
-            {
-                if (attempt + 1 >= _cfg.AcquireAttempts)
-                    throw new SessionStartException(
-                        $"Acquire failed after {_cfg.AcquireAttempts} attempts - the device is likely held by " +
-                        $"another app (Steam Input, a game launcher, or a leftover instance). Last error: {ex.Message}", ex);
-                int backoff = _cfg.BackoffFor(attempt);
-                Log.Warn($"[{ShortId}] acquire {attempt + 1}/{_cfg.AcquireAttempts} failed ({ex.Message}); retry in {backoff} ms");
-                Thread.Sleep(backoff);
-                if (_stop) throw new SessionStartException("Cancelled during acquire retries.", ex);
-            }
-        }
-    }
-
-    private void VerifyPairingStep()
-    {
-        string live;
-        try { live = _dev!.Properties.InterfacePath ?? ""; }
-        catch (Exception ex) { live = "<read failed: " + ex.Message + ">"; }
-
-        bool consistent = string.Equals(live.Trim(), _unit.DiInterfacePath.Trim(), StringComparison.OrdinalIgnoreCase);
-        Log.Info($"[{ShortId}] PAIRED  DI={InstanceGuid} path={live}  <->  HID={_unit.HidDevicePath ?? "<none>"}  " +
-                 $"cloak={_unit.HidHideInstancePath ?? "<none>"}  match={_unit.MatchKind}  consistent={consistent}");
-
-        // Positional pairing deliberately ignores the (ambiguous) DI path for identical units.
-        if (!consistent && _unit.MatchKind != "positional")
-            Log.Warn($"[{ShortId}] DI InterfacePath differs from the profiled one ('{_unit.DiInterfacePath}') - " +
-                     "check rumble lands on the right pad.");
-        if (_rumble is null)
-            Log.Warn($"[{ShortId}] no rumble handle - input-only");
-    }
-
     private void OpenRawHidReaderStep()
     {
-        var dev = DeviceList.Local.GetHidDevices().FirstOrDefault(
-            d => string.Equals(d.DevicePath, _unit.HidDevicePath, StringComparison.OrdinalIgnoreCase));
-        if (dev is null)
-            throw new SessionStartException("Raw-HID input device not found for this unit.");
-        if (!dev.TryOpen(out _hidReader))
+        _hidDevice = FindHidDevice()
+            ?? throw new SessionStartException("Raw-HID input device not found for this unit.");
+        try { _parser = new HidInputParser(_hidDevice.DevicePath); }
+        catch (Exception ex) { throw new SessionStartException("Could not read the HID report descriptor: " + ex.Message, ex); }
+        _rxInput = new byte[Math.Max(_parser.ReportLength, _hidDevice.GetMaxInputReportLength())];
+        if (!OpenHidReader())
             throw new SessionStartException("Could not open the raw-HID input device (in use, or blocked by HidHide).");
 
-        _hidReader.ReadTimeout = 1000;   // so the read loop notices _stop while the pad is idle
-        Log.Info($"[{ShortId}] raw HID input stream open");
+        // JoystickState defaults every POV to 0 (north); a pad without a hat must read centred.
+        Array.Fill(_state.PointOfViewControllers, -1);
+        Log.Info($"[{ShortId}] raw HID input stream open ({_rxInput.Length}-byte reports)");
     }
 
-    // Event-driven input for send-on-change pads (Bluetooth phone gamepads): block on a HID
-    // read, parse the report, push it. No polling, so no DIERR_INPUTLOST on an idle link.
-    private void RawHidReadThread()
+    private HidDevice? FindHidDevice() => DeviceList.Local.GetHidDevices().FirstOrDefault(
+        d => string.Equals(d.DevicePath, _unit.HidDevicePath, StringComparison.OrdinalIgnoreCase));
+
+    private bool OpenHidReader()
+    {
+        if (_hidDevice is null || !_hidDevice.TryOpen(out _hidReader)) return false;
+        _hidReader.ReadTimeout = 1000;   // so the read loop notices _stop on a pad that only sends on change
+        return true;
+    }
+
+    // Blocks until the pad sends a report, so input is forwarded the moment it arrives and the
+    // thread costs nothing while waiting - no poll interval, no spinning.
+    private void ReadThread()
+    {
+        try { ReadLoop(); }
+        catch (Exception ex) when (!_stop) { Fault($"Input thread failed: {ex.Message}"); }
+        catch { }   // shutdown disposed the stream, parser or pad under the loop
+    }
+
+    private void ReadLoop()
     {
         int errStreak = 0;
         while (!_stop)
         {
             int n;
             try { n = _hidReader!.Read(_rxInput, 0, _rxInput.Length); }
-            catch (TimeoutException) { continue; }
+            catch (TimeoutException) { ServiceRumble(Environment.TickCount64); continue; }
             catch (Exception ex)
             {
+                if (_stop) return;
                 errStreak++;
                 if (errStreak is 1 or 10) Log.Warn($"[{ShortId}] raw HID read error #{errStreak}: {ex.GetType().Name}: {ex.Message}");
                 if (errStreak >= 40) { Fault("Raw-HID input device stopped responding.", rebuild: true); return; }
@@ -319,13 +243,14 @@ internal sealed class ControllerSession : IDisposable
             }
 
             errStreak = 0;
-            int off = n - 6;                        // HidSharp prepends the (0) report-id byte
-            if (off < 0) continue;
-
-            ParseBtDinputReport(_rxInput.AsSpan(off, 6));
-            _mapper.Map(_state, ref _xb);
-            PushToPad();
-            try { _pad!.SubmitReport(); } catch (Exception ex) { Log.Warn($"[{ShortId}] SubmitReport: {ex.Message}"); }
+            if (n > 0)
+            {
+                _parser!.Parse(_rxInput, _state);
+                _mapper.Map(_state, ref _xb);
+                PushToPad();
+                try { _pad!.SubmitReport(); } catch (Exception ex) { Log.Warn($"[{ShortId}] SubmitReport: {ex.Message}"); }
+            }
+            ServiceRumble(Environment.TickCount64);
         }
     }
 
@@ -335,11 +260,9 @@ internal sealed class ControllerSession : IDisposable
         _hidReader = null;
         try
         {
-            var dev = DeviceList.Local.GetHidDevices().FirstOrDefault(
-                d => string.Equals(d.DevicePath, _unit.HidDevicePath, StringComparison.OrdinalIgnoreCase));
-            if (dev is null) { Log.Info($"[{ShortId}] raw HID reopen: device not present"); return false; }
-            if (!dev.TryOpen(out _hidReader)) { Log.Warn($"[{ShortId}] raw HID reopen: open failed"); return false; }
-            _hidReader.ReadTimeout = 1000;
+            _hidDevice = FindHidDevice();
+            if (_hidDevice is null) { Log.Info($"[{ShortId}] raw HID reopen: device not present"); return false; }
+            if (!OpenHidReader()) { Log.Warn($"[{ShortId}] raw HID reopen: open failed"); return false; }
             Log.Info($"[{ShortId}] raw HID input stream reopened");
             return true;
         }
@@ -349,21 +272,6 @@ internal sealed class ControllerSession : IDisposable
             return false;
         }
     }
-
-    // BluetoothPad DInput mode: 6-byte report [btn0-7][btn8-15][LX][LY][RX][RY], axes signed -127..127.
-    private void ParseBtDinputReport(ReadOnlySpan<byte> r)
-    {
-        int bits = r[0] | (r[1] << 8);
-        var btn = _state.Buttons;
-        for (int i = 0; i < 16 && i < btn.Length; i++) btn[i] = (bits & (1 << i)) != 0;
-
-        _state.X = AxisS8(r[2]);
-        _state.Y = AxisS8(r[3]);
-        _state.Z = AxisS8(r[4]);
-        _state.RotationX = AxisS8(r[5]);
-    }
-
-    private static int AxisS8(byte b) => ((sbyte)b + 127) * 65535 / 254;   // -127..127 -> 0..65535
 
     private void VirtualPadStep()
     {
@@ -399,7 +307,7 @@ internal sealed class ControllerSession : IDisposable
             _hidHide.HideDevice(p);
     }
 
-    // Poll thread only - single-threads all raw HID access.
+    // Input thread only - single-threads all raw HID rumble writes.
     private void ServiceRumble(long nowMs)
     {
         if (_rumble is null) return;
@@ -452,84 +360,6 @@ internal sealed class ControllerSession : IDisposable
         }
     }
 
-    private void PollThread()
-    {
-        var sw = Stopwatch.StartNew();
-        int errStreak = 0;
-
-        while (!_stop)
-        {
-            long loopStart = sw.ElapsedTicks;
-            long nowMs = loopStart * 1000 / Stopwatch.Frequency;
-            MeasureJitter(loopStart, nowMs);
-
-            try
-            {
-                _dev!.Poll().CheckError();
-                _dev.GetCurrentJoystickState(ref _state);
-                errStreak = 0;
-                _attachCheckCount = 0;
-
-                _mapper.Map(_state, ref _xb);
-                PushToPad();
-                _pad!.SubmitReport();
-                ServiceRumble(nowMs);
-            }
-            catch (Exception ex)
-            {
-                bool transient = IsTransientInputError(ex);
-                errStreak++;
-                if (errStreak is 1 or 10 || errStreak % 120 == 0)
-                    Log.Warn($"[{ShortId}] poll error #{errStreak}{(transient ? " (transient)" : "")}: {ex.Message}");
-
-                TryReacquire();
-
-                // A flaky link (Bluetooth especially) throws read faults for seconds at a time
-                // without the device being gone - only escalate to fault on sustained failure.
-                int escalateAfter = transient
-                    ? Math.Max(_cfg.PollErrorsBeforeAttachCheck * 10, 200)
-                    : _cfg.PollErrorsBeforeAttachCheck;
-
-                if (errStreak >= escalateAfter && Environment.TickCount64 - _lastAttachCheck > 2000)
-                {
-                    _lastAttachCheck = Environment.TickCount64;
-                    if (!DevicePairer.IsAttached(InstanceGuid))
-                    {
-                        Fault("Physical device is no longer attached.");
-                        return;
-                    }
-                    if (++_attachCheckCount >= 2)
-                    {
-                        Fault("Device is attached but this session can't read it (identity changed?) - rebuilding.", rebuild: true);
-                        return;
-                    }
-                    Log.Warn($"[{ShortId}] poll errors persist ({errStreak}), device still attached - one more retry window");
-                }
-                Thread.Sleep(transient ? 15 : 50);
-                continue;
-            }
-
-            SleepToTarget(sw, loopStart);
-        }
-    }
-
-    // ERROR_READ_FAULT (0x8007001E / DIERR_INPUTLOST) and ERROR_INVALID_ACCESS
-    // (0x8007000C / DIERR_NOTACQUIRED) - a link hiccup, not the device leaving.
-    private static bool IsTransientInputError(Exception ex) =>
-        ex.HResult is unchecked((int)0x8007001E) or unchecked((int)0x8007000C);
-
-    // Recovers a device that blinked out and came back under the same InstanceGuid.
-    private void TryReacquire()
-    {
-        try
-        {
-            _dev?.Unacquire();
-            _dev?.SetCooperativeLevel(_coopHwnd, _coop);
-            _dev?.Acquire();
-        }
-        catch { }
-    }
-
     private void PushToPad()
     {
         var p = _pad!;
@@ -556,41 +386,6 @@ internal sealed class ControllerSession : IDisposable
         p.SetSliderValue(Xbox360Slider.RightTrigger, _xb.RT);
     }
 
-    private void MeasureJitter(long loopStartTicks, long nowMs)
-    {
-        if (_lastLoopTicks != 0)
-        {
-            double dtMs = (loopStartTicks - _lastLoopTicks) * 1000.0 / Stopwatch.Frequency;
-            _jitterCount++;
-            _jitterSumMs += dtMs;
-            if (dtMs > _jitterMaxMs) _jitterMaxMs = dtMs;
-
-            if (dtMs > _cfg.JitterWarnMs && nowMs - _lastJitterWarnMs > 2000)
-            {
-                Log.Warn($"[{ShortId}] poll interval {dtMs:F1} ms > {_cfg.JitterWarnMs:F1} ms (CPU load / GC pause)");
-                _lastJitterWarnMs = nowMs;
-            }
-            if (_cfg.JitterReportSeconds > 0 && nowMs - _lastJitterReportMs > _cfg.JitterReportSeconds * 1000L)
-            {
-                double avg = _jitterSumMs / Math.Max(1, _jitterCount);
-                Log.Info($"[{ShortId}] poll timing: avg {avg:F2} ms / max {_jitterMaxMs:F1} ms over {_jitterCount} iters (target {_targetMs:F0} ms)");
-                _jitterCount = 0; _jitterSumMs = 0; _jitterMaxMs = 0;
-                _lastJitterReportMs = nowMs;
-            }
-        }
-        _lastLoopTicks = loopStartTicks;
-    }
-
-    private void SleepToTarget(Stopwatch sw, long loopStartTicks)
-    {
-        double Elapsed() => (sw.ElapsedTicks - loopStartTicks) * 1000.0 / Stopwatch.Frequency;
-        double remaining = _targetMs - Elapsed();
-        if (remaining > 1.5)
-            Thread.Sleep((int)(remaining - (_cfg.HighPrecisionTiming ? 1.0 : 0.0)));
-        if (_cfg.HighPrecisionTiming)
-            while (Elapsed() < _targetMs && !_stop) Thread.SpinWait(40);
-    }
-
     public bool RebuildRequested { get; private set; }
 
     private void Fault(string reason, bool rebuild = false)
@@ -613,29 +408,41 @@ internal sealed class ControllerSession : IDisposable
         Log.Info($"[{ShortId}] session DESTROYING guid={InstanceGuid}");
         _stop = true;
 
-        try { _thread?.Join(3000); }
-        catch (Exception ex) { Log.Warn($"[{ShortId}] poll thread join: {ex.Message}"); }
-
-        DisposeInternal();
+        DisposeInternal(WaitForInputThread());
         _status = SessionStatus.Disposed;
         Log.Info($"[{ShortId}] session DESTROYED guid={InstanceGuid}");
     }
 
-    // Every step guarded so nothing is skipped on the unhappy paths.
-    private void DisposeInternal()
+    // The read thread wakes at least once a second (ReadTimeout), so 3 s is ample. Past that it is stuck
+    // in a native call: closing the stream may free it, and nothing else it uses is disposed under it.
+    private bool WaitForInputThread()
     {
+        if (_thread is null) return true;
+        try
+        {
+            if (_thread.Join(3000)) return true;
+            Safe("hid reader", () => _hidReader?.Dispose());
+            if (_thread.Join(2000)) return true;
+        }
+        catch (ThreadStateException) { return true; }   // never started
+        Log.Error($"[{ShortId}] input thread did not exit - leaving its virtual pad and HID handles allocated");
+        return false;
+    }
+
+    // Every step guarded so nothing is skipped on the unhappy paths.
+    private void DisposeInternal(bool threadExited = true)
+    {
+        Safe("pad unsubscribe", () => { if (_pad is not null) _pad.FeedbackReceived -= OnFeedbackReceived; });
+        if (!threadExited) return;
+
         Safe("rumble stop", () => { if (_rumble is { IsInvalid: false }) SendPayload(0xF3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00); });
         Safe("rumble handle", () => { _rumble?.Dispose(); _rumble = null; });
         Safe("hid reader", () => { _hidReader?.Dispose(); _hidReader = null; });
+        Safe("hid parser", () => { _parser?.Dispose(); _parser = null; });
 
-        Safe("pad unsubscribe", () => { if (_pad is not null) _pad.FeedbackReceived -= OnFeedbackReceived; });
         Safe("pad reset", () => { if (_pad is not null) { _pad.ResetReport(); _pad.SubmitReport(); } });
         Safe("pad disconnect", () => _pad?.Disconnect());
         Safe("pad dispose", () => { (_pad as IDisposable)?.Dispose(); _pad = null; });
-
-        Safe("device unacquire", () => _dev?.Unacquire());
-        Safe("device dispose", () => { _dev?.Dispose(); _dev = null; });
-        Safe("dinput dispose", () => { _di?.Dispose(); _di = null; });
     }
 
     private void Safe(string what, Action a)

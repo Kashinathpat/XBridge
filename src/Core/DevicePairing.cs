@@ -5,7 +5,7 @@ using Vortice.DirectInput;
 
 namespace XBridge.Core;
 
-// One physical gamepad with both halves resolved: DirectInput (input) + raw HID + PnP instance
+// One physical gamepad: its DirectInput identity (enumeration), raw HID device (input + rumble) and PnP instance
 // path (HidHide cloak). MatchKind is "exact" | "positional" | "none".
 internal sealed record GamepadUnit(
     Guid DiInstanceGuid,
@@ -16,8 +16,7 @@ internal sealed record GamepadUnit(
     string? HidDevicePath,
     int HidMaxOutputLength,
     string? HidHideInstancePath,
-    string MatchKind,
-    bool RawHidInput)
+    string MatchKind)
 {
     // A paired raw HID device exists (used for the stable session key), regardless of rumble.
     public bool HasHidPath => !string.IsNullOrEmpty(HidDevicePath);
@@ -36,62 +35,58 @@ internal static class DevicePairer
         var hidList = EnumerateHid(devices);
         var pnpIds = HidHideManager.EnumerateInstancePaths(devices).ToList();
 
-        // Exact 1:1 on interface path (DIPROP_GUIDANDPATH <-> HidDevice.DevicePath).
-        var exact = new Dictionary<Guid, HidDevice>();
-        foreach (var d in diList)
-        {
-            string n = Normalize(d.ifacePath);
-            if (n.Length == 0) continue;
-            var hid = hidList.FirstOrDefault(h => Normalize(h.DevicePath) == n);
-            if (hid is not null) exact[d.guid] = hid;
-        }
-
-        bool distinct = exact.Values.Select(h => h.DevicePath)
-                                    .Distinct(StringComparer.OrdinalIgnoreCase).Count() == exact.Count;
-        bool clean = diList.Count > 0 && exact.Count == diList.Count && distinct;
-
-        // Identical units can make two DI instances report the same interface path and collapse
-        // onto one HID node - when the match isn't a clean 1:1, pair by sorted order instead.
-        var diOrdered = diList.OrderBy(d => d.guid).ToList();
-        var pairing = new Dictionary<Guid, HidDevice?>();
-        string mode;
-        if (clean)
-        {
-            mode = "exact";
-            foreach (var d in diOrdered) pairing[d.guid] = exact[d.guid];
-        }
-        else
-        {
-            mode = "positional";
-            var hidOrdered = hidList.OrderBy(h => h.DevicePath, StringComparer.OrdinalIgnoreCase).ToList();
-            Log.Warn($"Pairing: exact DI<->HID match is not 1:1 " +
-                     $"({exact.Count} matched / {diList.Count} DI / {hidList.Count} HID) - pairing positionally");
-            foreach (var h in hidList) Log.Warn($"  HID='{h.DevicePath}'");
-            for (int i = 0; i < diOrdered.Count; i++)
-                pairing[diOrdered[i].guid] = i < hidOrdered.Count ? hidOrdered[i] : null;
-        }
-
-        var pnpOrdered = pnpIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+        // Pair within each VID/PID group so a pad is never matched to another model's HID node or
+        // cloak id. Unambiguous exact matches (DIPROP_GUIDANDPATH == HidDevice.DevicePath) are kept;
+        // identical units can report the same interface path and collapse onto one HID node, so the
+        // rest of the group is paired by sorted order.
         var units = new List<GamepadUnit>(diList.Count);
-        for (int i = 0; i < diOrdered.Count; i++)
+        foreach (var group in diList.GroupBy(d => (d.vid, d.pid)))
         {
-            var (guid, vid, pid, name, ifacePath) = diOrdered[i];
-            var hid = pairing.GetValueOrDefault(guid);
-            bool rawHid = devices.FirstOrDefault(d => d.Matches(vid, pid))?.RawHid ?? false;
+            var dis = group.OrderBy(d => d.guid).ToList();
+            var hids = hidList.Where(h => h.VendorID == group.Key.vid && h.ProductID == group.Key.pid)
+                              .OrderBy(h => h.DevicePath, StringComparer.OrdinalIgnoreCase).ToList();
+            var groupPnp = pnpIds.Where(id => HidHideManager.TryExtractVidPid(id, out var v, out var p)
+                                              && v == group.Key.vid && p == group.Key.pid)
+                                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
 
-            // Derive the cloak id from the HID device path (reliable) not the DI path (may collide).
-            string? cloakId = hid is not null
-                ? DeriveInstanceId(hid.DevicePath, pnpIds, InstanceToken(hid.DevicePath))
-                : DeriveInstanceId(ifacePath, pnpIds, InstanceToken(ifacePath));
-            cloakId ??= i < pnpOrdered.Count ? pnpOrdered[i] : null;   // last resort: a distinct WMI id by position
+            var matchedBy = dis.ToDictionary(d => d.guid,
+                d => Normalize(d.ifacePath) is { Length: > 0 } n ? hids.FirstOrDefault(h => Normalize(h.DevicePath) == n) : null);
+            var unique = matchedBy.Where(kv => kv.Value is not null
+                                               && matchedBy.Count(o => ReferenceEquals(o.Value, kv.Value)) == 1)
+                                  .ToDictionary(kv => kv.Key, kv => kv.Value!);
+            var spareHids = hids.Where(h => !unique.ContainsValue(h)).ToList();
+            var leftover = dis.Where(d => !unique.ContainsKey(d.guid)).ToList();
+            if (leftover.Count > 0)
+                Log.Warn($"Pairing VID {group.Key.vid:X4}/PID {group.Key.pid:X4}: {leftover.Count} of {dis.Count} pad(s) " +
+                         $"have no unambiguous HID match - pairing those by order ({spareHids.Count} spare HID node(s))");
 
-            if (hid is null)
+            for (int i = 0; i < dis.Count; i++)
             {
-                Log.Error($"Pairing[{guid.ToString()[..8]}]: no raw HID device paired (name='{name.Trim()}').");
-                units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, null, 0, cloakId, "none", rawHid));
-                continue;
+                var (guid, vid, pid, name, ifacePath) = dis[i];
+                HidDevice? hid;
+                string mode;
+                if (unique.TryGetValue(guid, out var exactHid)) { hid = exactHid; mode = "exact"; }
+                else
+                {
+                    int slot = leftover.FindIndex(d => d.guid == guid);
+                    hid = slot < spareHids.Count ? spareHids[slot] : null;
+                    mode = "positional";
+                }
+
+                // Derive the cloak id from the HID device path (reliable) not the DI path (may collide).
+                string? cloakId = hid is not null
+                    ? DeriveInstanceId(hid.DevicePath, pnpIds, InstanceToken(hid.DevicePath))
+                    : DeriveInstanceId(ifacePath, pnpIds, InstanceToken(ifacePath));
+                cloakId ??= i < groupPnp.Count ? groupPnp[i] : null;   // last resort: a same-model WMI id by position
+
+                if (hid is null)
+                {
+                    Log.Error($"Pairing[{guid.ToString()[..8]}]: no raw HID device paired (name='{name.Trim()}').");
+                    units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, null, 0, cloakId, "none"));
+                    continue;
+                }
+                units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, hid.DevicePath, hid.SafeMaxOut(), cloakId, mode));
             }
-            units.Add(new GamepadUnit(guid, vid, pid, name, ifacePath, hid.DevicePath, hid.SafeMaxOut(), cloakId, mode, rawHid));
         }
 
         // Log the per-unit summary only when the pairing set changes (not every re-scan).
@@ -104,15 +99,6 @@ internal static class DevicePairer
                          $"HID='{Ellipsis(u.HidDevicePath ?? "<none>")}'  hidHide='{u.HidHideInstancePath ?? "<none>"}'  maxOut={u.HidMaxOutputLength}");
         }
         return units;
-    }
-
-    // Direct "is this instance still attached?" query - less racy than a full EnumDevices.
-    public static bool IsAttached(Guid instanceGuid)
-    {
-        IDirectInput8? di = null;
-        try { di = DInput.DirectInput8Create(); return di.IsDeviceAttached(instanceGuid); }
-        catch { return true; }   // can't tell -> assume still there, don't tear a healthy session down
-        finally { try { di?.Dispose(); } catch { } }
     }
 
     // Never cache DIPROP_GUIDANDPATH by guid: DirectInput reassigns InstanceGuids among

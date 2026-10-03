@@ -73,23 +73,36 @@ internal sealed class MappingProfile
         if (!File.Exists(path) && File.Exists(legacy) && vid == 0x0079 && pid == 0x0006)
             try { File.Copy(legacy, path); Log.Info($"Migrated mapping.json -> {Path.GetFileName(path)}"); } catch { }
 
+        if (!File.Exists(path))
+        {
+            var def = Default(vid, pid);
+            def.Save(vid, pid);
+            Log.Info($"Mapping created with defaults at {Path.GetFileName(path)} (run --calibrate to tune it)");
+            return def;
+        }
+
         try
         {
-            if (File.Exists(path))
+            var p = JsonSerializer.Deserialize<MappingProfile>(File.ReadAllText(path), JsonOpts)
+                    ?? throw new JsonException("the file contains null");
+            // InputMapper dereferences these on every report; a hand-edited null must not fault every session.
+            if (p.LeftStick is null || p.RightStick is null || p.Buttons is null)
             {
-                var p = JsonSerializer.Deserialize<MappingProfile>(File.ReadAllText(path), JsonOpts);
-                if (p is not null) { Log.Info($"Mapping loaded from {Path.GetFileName(path)}"); return p; }
+                var d = Default(vid, pid);
+                p.LeftStick ??= d.LeftStick;
+                p.RightStick ??= d.RightStick;
+                p.Buttons ??= d.Buttons;
+                Log.Warn($"Mapping {Path.GetFileName(path)}: LeftStick, RightStick or Buttons is missing - using this pad's defaults for it");
             }
+            Log.Info($"Mapping loaded from {Path.GetFileName(path)}");
+            return p;
         }
         catch (Exception ex)
         {
-            Log.Error($"Mapping load failed for {Path.GetFileName(path)} - using defaults", ex);
+            // Leave the file as-is so one typo doesn't wipe the user's calibration.
+            Log.Error($"Mapping load failed for {Path.GetFileName(path)} - using defaults; file left unchanged so it can be fixed", ex);
+            return Default(vid, pid);
         }
-
-        var def = Default(vid, pid);
-        def.Save(vid, pid);
-        Log.Info($"Mapping created with defaults at {Path.GetFileName(path)} (run --calibrate to tune it)");
-        return def;
     }
 
     public void Save(ushort vid, ushort pid)

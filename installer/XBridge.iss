@@ -3,7 +3,7 @@
 
 #define AppName       "XBridge"
 #define AppShortName  "XBridge"
-#define AppVersion    "1.0.0"
+#define AppVersion    "2.0.0"
 #define AppPublisher  "XBridge"
 #define AppExe        "XBridge.exe"
 #define PublishDir    "..\publish"
@@ -172,25 +172,30 @@ begin
            mbError, MB_OK);
 end;
 
-procedure StopRunningApp();
+procedure KillRunningApp();
 var
   rc: Integer;
-  exe: string;
 begin
-  exe := ExpandConstant('{app}\{#AppExe}');
-
-  { Graceful: let the app release its HidHide entries (device un-hide + app un-reg + cloak off). }
-  if FileExists(exe) then
-  begin
-    Log('Releasing HidHide state via --hidhide-cleanup');
-    Exec(exe, '--hidhide-cleanup', '', SW_HIDE, ewWaitUntilTerminated, rc);
-  end;
-
-  { Then make sure no instance is holding a file open. }
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM {#AppExe}',    '', SW_HIDE, ewWaitUntilTerminated, rc);
   Sleep(800);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, rc);
   Sleep(400);
+end;
+
+{ Let the app release its HidHide entries (device un-hide + app un-reg + cloak off).
+  Run only after the app is stopped, or its periodic re-hide could undo it. }
+function ReleaseHidHide(): Boolean;
+var
+  rc: Integer;
+  exe: string;
+begin
+  Result := True;
+  exe := ExpandConstant('{app}\{#AppExe}');
+  if FileExists(exe) then
+  begin
+    Result := Exec(exe, '--hidhide-cleanup', '', SW_HIDE, ewWaitUntilTerminated, rc) and (rc = 0);
+    Log('XBridge --hidhide-cleanup exit ' + IntToStr(rc));
+  end;
 end;
 
 { Pre-seed HidHide's allow-list with our exe (via the managed HidHide API, elevated here)
@@ -209,9 +214,10 @@ var
 begin
   if CurStep = ssInstall then
   begin
-    { On update / reinstall: stop the old instance BEFORE overwriting files so its
-      HidHide entries are not orphaned and its exe is not locked. }
-    StopRunningApp();
+    { On update / reinstall: stop the old instance so its exe is not locked. Pads stay hidden on
+      purpose - the new version inherits hidden-devices.txt, and un-hiding them here would make
+      them visible to browsers again until they are reconnected. }
+    KillRunningApp();
     { .NET is NOT bundled - fetch + silently install the runtime if it is missing. }
     EnsureDotNetDesktopRuntime();
     InstallDriverIfMissing('{#ViGEmSetup}',   SERVICE_VIGEM,   'ViGEmBus');
@@ -232,13 +238,40 @@ begin
   Result := DriversJustInstalled;
 end;
 
+{ Uninstalling while devices are still blocked would leave them hidden with no XBridge left to
+  un-hide them, so a failed cleanup stops the uninstall instead. }
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  KillRunningApp();
+
+  { hidden-devices.txt is deleted by every successful cleanup, so its presence means pads are still hidden. }
+  if not FileExists(ExpandConstant('{app}\{#AppExe}')) then
+  begin
+    if FileExists(ExpandConstant('{localappdata}\XBridge\hidden-devices.txt')) then
+      Result := SuppressibleMsgBox('{#AppExe} is missing, so the controllers XBridge hid cannot be un-hidden automatically.' + #13#10#13#10 +
+           'Cancel, run the XBridge installer again to repair it, then uninstall. Or click OK to uninstall anyway and un-hide them yourself in the HidHide Configuration Client.',
+           mbError, MB_OKCANCEL, IDCANCEL) = IDOK;
+    Exit;
+  end;
+
+  while not ReleaseHidHide() do
+    if SuppressibleMsgBox('XBridge could not un-hide your controllers in HidHide, so they would stay invisible to games after uninstalling.' + #13#10#13#10 +
+         'Close the HidHide Configuration Client if it is open, then click Retry. Cancel stops the uninstall.',
+         mbError, MB_RETRYCANCEL, IDCANCEL) <> IDRETRY then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   rc: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    StopRunningApp();
+    KillRunningApp();
     Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "{#AppShortName}"',
          '', SW_HIDE, ewWaitUntilTerminated, rc);
   end;

@@ -167,14 +167,19 @@ internal sealed class HidHideManager
     });
 
     // Bring one device fully under HidHide: allow-list this exe, block the device, enable hiding.
-    public bool CloakDevice(string instanceId, string exePath) => Mutate("cloak " + Short(instanceId), s =>
+    // The id is recorded before blocking, so a failed write never leaves a block cleanup can't find.
+    public bool CloakDevice(string instanceId, string exePath)
     {
-        if (!s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
-            s.AddApplicationPath(exePath, false);
-        if (!s.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
-            s.AddBlockedInstanceId(instanceId);
-        if (!s.IsActive) s.IsActive = true;
-    });
+        if (!RecordOwned(instanceId)) return false;
+        return Mutate("cloak " + Short(instanceId), s =>
+        {
+            if (!s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
+                s.AddApplicationPath(exePath, false);
+            if (!s.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
+                s.AddBlockedInstanceId(instanceId);
+            if (!s.IsActive) s.IsActive = true;
+        });
+    }
 
     // Put this exe on HidHide's application allow-list.
     public bool RegisterApp(string exePath) => Mutate("register app", s =>
@@ -183,19 +188,72 @@ internal sealed class HidHideManager
             s.AddApplicationPath(exePath, false);
     });
 
-    // --cloak-off / uninstall: unblock our devices, unregister this exe, and drop global
-    // hiding only if nobody else is blocking anything.
-    public void GlobalUncloak(string exePath) => Mutate("global uncloak", s =>
+    // --cloak-off / uninstall: unblock every device this app hid, unregister this exe, and drop global
+    // hiding only if nobody else is blocking anything. False means devices may still be hidden.
+    public bool GlobalUncloak(string exePath)
     {
-        foreach (var id in s.BlockedInstanceIds.Where(IsOurs).ToList())
-            s.RemoveBlockedInstanceId(id);
+        var owned = LoadOwned();
+        if (owned is null) return false;   // can't tell which blocks are ours - don't claim success
+        bool ok = Mutate("global uncloak", s =>
+        {
+            foreach (var id in s.BlockedInstanceIds.Where(id => owned.Contains(id) || IsOurs(id)).ToList())
+                s.RemoveBlockedInstanceId(id);
 
-        if (s.BlockedInstanceIds.Count == 0 && s.IsActive)
-            s.IsActive = false;
+            if (s.BlockedInstanceIds.Count == 0 && s.IsActive)
+                s.IsActive = false;
 
-        if (s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
-            s.RemoveApplicationPath(exePath);
-    });
+            if (s.ApplicationPaths.Contains(exePath, StringComparer.OrdinalIgnoreCase))
+                s.RemoveApplicationPath(exePath);
+        });
+        if (ok)
+            try { File.Delete(OwnedPath); } catch (Exception ex) { Log.Warn("Could not clear " + OwnedPath + ": " + ex.Message); }
+        return ok;
+    }
+
+    // Every instance id this app has blocked, independent of the current Devices list, so cleanup
+    // still un-hides a pad whose VID/PID was removed from the config after it was hidden.
+    private static string OwnedPath => Path.Combine(AppConfig.ConfigDir, "hidden-devices.txt");
+
+    // Null when the list exists but can't be read.
+    private HashSet<string>? LoadOwned()
+    {
+        try
+        {
+            return File.Exists(OwnedPath)
+                ? new HashSet<string>(File.ReadAllLines(OwnedPath).Where(l => l.Length > 0), StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            LastError = "could not read " + OwnedPath + ": " + ex.Message;
+            LastErrorWasBusy = false;
+            Log.Error("HidHide: " + LastError);
+            return null;
+        }
+    }
+
+    private bool RecordOwned(string instanceId)
+    {
+        lock (_gate)
+        {
+            var owned = LoadOwned();
+            if (owned is null) return false;
+            if (!owned.Add(instanceId)) return true;
+            try
+            {
+                Directory.CreateDirectory(AppConfig.ConfigDir);
+                File.WriteAllLines(OwnedPath, owned);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastError = "could not record the hidden device in " + OwnedPath + ": " + ex.Message;
+                LastErrorWasBusy = false;
+                Log.Error("HidHide: " + LastError);
+                return false;
+            }
+        }
+    }
 
     private bool IsOurs(string instanceId) =>
         TryExtractVidPid(instanceId, out var v, out var p) && _devices.Any(d => d.Matches(v, p));

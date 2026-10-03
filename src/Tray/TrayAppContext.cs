@@ -7,12 +7,11 @@ using XBridge.Interop;
 
 namespace XBridge.Tray;
 
-// Tray icon (grey idle / green N-active / red error) + menu, plus a hidden message window that is
-// both the DirectInput cooperative HWND and the WM_DEVICECHANGE sink for hot-plug detection.
+// Tray icon (grey idle / green N-active / red error) + menu, plus a hidden message window that
+// receives WM_DEVICECHANGE for hot-plug detection.
 internal sealed class TrayAppContext : ApplicationContext
 {
     private readonly MessageWindow _msg;
-    private readonly IntPtr _msgHwnd;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem;
 
@@ -25,7 +24,7 @@ internal sealed class TrayAppContext : ApplicationContext
     public TrayAppContext(AppConfig cfg, string ownExe)
     {
         _msg = new MessageWindow(OnDeviceChange);
-        _msgHwnd = _msg.Handle; // force creation on the UI thread; value is stable
+        _ = _msg.Handle; // force handle creation on the UI thread (device-change messages + BeginInvoke)
 
         BuildIcons();
 
@@ -47,7 +46,7 @@ internal sealed class TrayAppContext : ApplicationContext
         };
 
         _hidHide = new HidHideManager(cfg.Devices);
-        _manager = new SessionManager(cfg, _hidHide, ownExe, () => _msgHwnd)
+        _manager = new SessionManager(cfg, _hidHide, ownExe)
         {
             Notify = (title, body, isError) => ShowBalloon(title, body, isError ? ToolTipIcon.Error : ToolTipIcon.Info),
         };
@@ -209,8 +208,6 @@ internal sealed class TrayAppContext : ApplicationContext
         try { _manager.DisposeAll(); }
         catch (Exception ex) { Log.Error("cleanup: SessionManager.DisposeAll", ex); }
 
-        try { NativeMethods.timeEndPeriod(1); } catch { }
-
         try
         {
             _tray.Visible = false;
@@ -236,7 +233,7 @@ internal sealed class TrayAppContext : ApplicationContext
         base.Dispose(disposing);
     }
 
-    // Invisible window: DirectInput cooperative HWND + WM_DEVICECHANGE sink.
+    // Invisible window that receives WM_DEVICECHANGE.
     private sealed class MessageWindow : Form
     {
         private readonly Action _onDeviceChange;

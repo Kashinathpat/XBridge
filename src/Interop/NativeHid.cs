@@ -44,6 +44,10 @@ internal static class NativeHid
         return null;
     }
 
+    // Zero-access handle - enough to read the descriptor, never conflicts with readers or writers.
+    public static SafeFileHandle OpenForQuery(string devicePath) =>
+        CreateFileW(devicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+
     public static bool SetOutputReport(SafeFileHandle handle, byte[] buffer, out string error)
     {
         error = "";

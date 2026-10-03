@@ -30,7 +30,6 @@ internal sealed class SessionManager
     private readonly AppConfig _cfg;
     private readonly HidHideManager _hidHide;
     private readonly string _ownExe;
-    private readonly Func<IntPtr> _hwndProvider;
 
     private ViGEmClient? _client;
     private string? _clientError;
@@ -46,12 +45,11 @@ internal sealed class SessionManager
     public event Action<ManagerState>? StateChanged;
     public Action<string, string, bool>? Notify { get; set; }   // title, body, isError -> tray balloon
 
-    public SessionManager(AppConfig cfg, HidHideManager hidHide, string ownExe, Func<IntPtr> hwndProvider)
+    public SessionManager(AppConfig cfg, HidHideManager hidHide, string ownExe)
     {
         _cfg = cfg;
         _hidHide = hidHide;
         _ownExe = ownExe;
-        _hwndProvider = hwndProvider;
     }
 
     // One InputMapper (and mapping file) per VID/PID - different controller layouts differ.
@@ -167,13 +165,6 @@ internal sealed class SessionManager
             if (!listedAbsent)
             {
                 _missingPasses.Remove(key);
-                // Same physical slot, but DirectInput handed this unit a new InstanceGuid (it
-                // reshuffles them among identical pads) - the session's DI handle is now stale.
-                if (unit!.DiInstanceGuid != session.InstanceGuid)
-                {
-                    Log.Info($"Reconcile({trigger}): {sid} DI identity changed -> {Short(unit.DiInstanceGuid)} - rebuilding");
-                    RemoveSession(key, session);
-                }
                 continue;
             }
 
@@ -224,14 +215,14 @@ internal sealed class SessionManager
                     Log.Info($"Reconcile({trigger}): {Short(guid)} not yet paired to a raw HID device ({u}/{_cfg.PairRetryPasses}) - retrying");
                     continue;
                 }
-                Log.Warn($"Reconcile({trigger}): {Short(guid)} still unpaired after {u} passes. RequireHidPairing={_cfg.RequireHidPairing}.");
+                Log.Warn($"Reconcile({trigger}): {Short(guid)} still unpaired after {u} passes.");
             }
             else
             {
                 _unpairedPasses.Remove(guid);
             }
 
-            var session = new ControllerSession(unit, _hwndProvider(), _client!, MapperFor(unit.Vid, unit.Pid),
+            var session = new ControllerSession(unit, _client!, MapperFor(unit.Vid, unit.Pid),
                 _cfg, _hidHide, _ownExe, OnSessionFaulted);
             try
             {

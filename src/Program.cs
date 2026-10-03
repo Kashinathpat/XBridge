@@ -10,6 +10,10 @@ namespace XBridge;
 
 internal static class Program
 {
+    // Held by the tray instance for its lifetime: a second tray would bridge the same pads twice, and
+    // --cloak-off must not run under a live instance whose periodic re-hide would undo it.
+    private const string TrayMutexName = @"Local\XBridge-Tray-3F2A9C41";
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -61,9 +65,15 @@ internal static class Program
 
     private static int RunTray(AppConfig cfg)
     {
-        NativeMethods.timeBeginPeriod(1); // 1 ms scheduler tick for low-jitter polling
-
         ApplicationConfiguration.Initialize();
+        using var trayMutex = new Mutex(true, TrayMutexName, out bool firstInstance);
+        if (!firstInstance)
+        {
+            Log.Warn("Another XBridge tray instance is already running - exiting.");
+            MessageBox.Show("XBridge is already running - look for its icon in the notification area.", "XBridge",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return 0;
+        }
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) =>
         {
@@ -87,20 +97,22 @@ internal static class Program
         Log.EnableConsoleMirror();
         Log.Info("Running one-shot HidHide cleanup (--cloak-off / --hidhide-cleanup).");
 
-        string ownExe = Environment.ProcessPath ?? "XBridge.exe";
-        try
+        if (Mutex.TryOpenExisting(TrayMutexName, out var running))
         {
-            var hh = new HidHideManager(cfg.Devices);
-            hh.GlobalUncloak(ownExe);
-            Console.WriteLine("HidHide: devices un-hidden, this app un-registered, cloak disabled.");
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            Log.Error("HidHide cleanup failed", ex);
-            Console.WriteLine("HidHide cleanup failed: " + ex.Message);
+            running.Dispose();
+            Console.WriteLine("XBridge is running - exit it from its tray icon first, then run this again.");
             return 1;
         }
+
+        string ownExe = Environment.ProcessPath ?? "XBridge.exe";
+        var hh = new HidHideManager(cfg.Devices);
+        if (!hh.GlobalUncloak(ownExe))
+        {
+            Console.WriteLine("HidHide cleanup failed - devices may still be hidden: " + (hh.LastError ?? "see the log"));
+            return 1;
+        }
+        Console.WriteLine("HidHide: devices un-hidden, this app un-registered, cloak disabled.");
+        return 0;
     }
 
     private static int HidHideRegister(AppConfig cfg)
@@ -140,7 +152,7 @@ internal static class Program
         Console.WriteLine(
             """
             XBridge - emulates Xbox 360 controllers (with rumble) from up to four
-            DirectInput gamepads and hides the physical devices via HidHide. Which
+            HID gamepads and hides the physical devices via HidHide. Which
             controllers to bridge is set by the Devices list in config.json.
 
             Usage:
@@ -151,12 +163,13 @@ internal static class Program
                                                   mapping file for that pad.
               XBridge.exe --cloak-off     One-shot: un-hide devices, un-register
               XBridge.exe --hidhide-cleanup   this exe, disable cloak, then exit
-                                                  (used by the installer/uninstaller).
+                                                  (used by the uninstaller; quit the tray app first).
               XBridge.exe --help          This text.
 
             Files (all under %LOCALAPPDATA%\XBridge):
-              config.json              Devices list, poll interval, dead zones, RequireCloak
+              config.json              Devices list, dead zones, RequireCloak, rumble tuning
               mapping-<vid>-<pid>.json  button/axis calibration, one file per pad layout
+              hidden-devices.txt       pads XBridge has hidden, so --cloak-off can un-hide them
               logs\app.log             rolling, size-capped diagnostic log
             """);
         Console.WriteLine();

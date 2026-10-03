@@ -4,21 +4,9 @@ namespace XBridge.Interop;
 
 internal static class NativeMethods
 {
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    public static extern uint timeBeginPeriod(uint uPeriod);
-
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    public static extern uint timeEndPeriod(uint uPeriod);
-
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool AllocConsole();
-
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

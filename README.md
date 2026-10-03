@@ -11,15 +11,13 @@ It has no window — it lives in the notification area. The tray icon shows stat
 
 ## What it does
 
-- Reads each connected pad in the `config.json` `Devices` list via DirectInput and
-  exposes one virtual Xbox 360 controller for it (ViGEmBus). A pad flagged
-  `Input:"rawhid"` (e.g. a Bluetooth phone gamepad that only sends a report on
-  change, which starves DirectInput polling) is read through its raw HID reports
-  instead.
+- Reads each connected pad in the `config.json` `Devices` list straight from its
+  own HID reports and exposes one virtual Xbox 360 controller for it (ViGEmBus).
+  Each report is forwarded the moment it arrives — no polling, near-zero CPU.
 - Each pad layout is mapped via its own `mapping-<vid>-<pid>.json`, filled in once
   with `--calibrate`.
-- Rumble: the DragonRise pad gets it via a raw-HID output report. Anything without
-  a resolvable raw-HID path runs input-only.
+- Rumble: the DragonRise pad gets it via a raw-HID output report. A pad with no
+  output report (like the BluetoothPad) runs input-only.
 - Hides each physical pad from other applications (HidHide), so a game binds to
   the Xbox pad only and never sees a double input. The hide is permanent (it stays
   when XBridge exits) because Windows decides at connect time whether RawInput
@@ -41,7 +39,7 @@ It has no window — it lives in the notification area. The tray icon shows stat
 
 ## Install
 
-Run `XBridge-Setup-1.0.0.exe`. It installs the app to `%ProgramFiles%\XBridge`,
+Run `XBridge-Setup-2.0.0.exe`. It installs the app to `%ProgramFiles%\XBridge`,
 installs any missing driver / runtime, registers the app on HidHide's allow-list,
 and sets it to start at sign-in. **Reboot when it asks** if it just installed a
 driver — HidHide only starts hiding a pad after its device stack is rebuilt (a
@@ -57,7 +55,7 @@ Command-line options (framework-dependent build — `XBridge.exe <flag>`):
 | flag | purpose |
 |---|---|
 | `--calibrate [--index N \| --guid <g>]` | print raw button / axis / POV indices while you press controls, to fill in a pad's mapping file |
-| `--hidhide-cleanup` | un-hide the pads, remove this exe from HidHide, disable the cloak, exit |
+| `--hidhide-cleanup` | un-hide the pads, remove this exe from HidHide, disable the cloak, exit (quit the tray app first) |
 | `--help` | usage |
 
 ## Configuration — `%LocalAppData%\XBridge\`
@@ -66,12 +64,10 @@ Command-line options (framework-dependent build — `XBridge.exe <flag>`):
 
 | key | default | meaning |
 |---|---|---|
-| `Devices` | `[{Vid:"0079",Pid:"0006"}]` | which controllers to bridge, by USB VID/PID (4 hex digits). Add `Input:"rawhid"` to an entry for a pad that only sends a report on change (e.g. a Bluetooth phone gamepad). |
-| `PollIntervalMs` | 5 | how often each pad's state is pushed to its virtual pad |
+| `Devices` | DragonRise `0079/0006`, BluetoothPad `038F/1200` | which controllers to bridge, by USB VID/PID (4 hex digits). Add an entry per new pad. |
 | `LeftStickDeadzone` / `RightStickDeadzone` | 0.12 | radial dead zone, fraction of full range |
 | `TriggerDeadzone` | 0.06 | analog-trigger dead zone |
 | `RequireCloak` | true | don't expose a virtual pad unless the physical one was hidden |
-| `RequireHidPairing` | true | don't start a pad with no resolvable HID device (needed to cloak it) |
 | `RumbleRepeat` | 3 | times the DragonRise rumble packet is re-sent per change (it needs a few to latch) |
 | `RumbleWeak0x0AQuirk` | true | send `0x0B` when the weak value would be `0x0A` (DragonRise quirk) |
 | `LogMaxBytes` / `LogMaxFiles` | 1 MiB / 5 | rolling-log cap |
@@ -83,7 +79,10 @@ each control, and put the printed indices into that file (axis convention `0=X
 `"ZAxisSplit"`). Restart to apply.
 
 `logs\app.log` is a rolling, size-capped log — session lifecycle, driver
-preflight, HidHide calls, poll-timing, warnings and errors.
+preflight, HidHide calls, warnings and errors.
+
+`hidden-devices.txt` lists every pad XBridge has hidden, so `--hidhide-cleanup` (and
+the uninstaller) can un-hide them even after a pad is removed from `Devices`.
 
 ## Build
 
@@ -103,4 +102,4 @@ installer\build.cmd
 Output: `publish\XBridge.exe`. To build the installer, also put
 `ViGEmBusSetup_x64.exe` and `HidHideSetup_x64.exe` in `installer\redist\` (see
 that folder's `README.txt`) and have Inno Setup 6 on `PATH`; `build.cmd` then
-compiles `installer\Output\XBridge-Setup-1.0.0.exe`.
+compiles `installer\Output\XBridge-Setup-2.0.0.exe`.
