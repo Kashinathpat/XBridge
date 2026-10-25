@@ -1,5 +1,3 @@
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using XBridge.Config;
 using XBridge.Core;
 using XBridge.Diagnostics;
@@ -18,7 +16,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly HidHideManager _hidHide;
     private readonly SessionManager _manager;
 
-    private readonly Dictionary<ManagerStatus, (Icon icon, IntPtr handle)> _icons = new();
+    private readonly Dictionary<ManagerStatus, Icon> _icons = new();
     private int _cleaned;
 
     public TrayAppContext(AppConfig cfg, string ownExe)
@@ -39,7 +37,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         _tray = new NotifyIcon
         {
-            Icon = _icons[ManagerStatus.Idle].icon,
+            Icon = _icons[ManagerStatus.Idle],
             Text = "XBridge (starting)",
             Visible = true,
             ContextMenuStrip = menu,
@@ -78,7 +76,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private void UpdateTrayFromState(ManagerState st)
     {
         var key = _icons.ContainsKey(st.Status) ? st.Status : ManagerStatus.Idle;
-        _tray.Icon = _icons[key].icon;
+        _tray.Icon = _icons[key];
 
         string text = st.Status switch
         {
@@ -170,28 +168,17 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void BuildIcons()
     {
-        _icons[ManagerStatus.Idle] = MakeIcon(Color.FromArgb(150, 150, 150));
-        _icons[ManagerStatus.Active] = MakeIcon(Color.FromArgb(40, 170, 70));
-        _icons[ManagerStatus.Error] = MakeIcon(Color.FromArgb(200, 60, 50));
+        _icons[ManagerStatus.Idle] = LoadIcon("tray-idle.ico");
+        _icons[ManagerStatus.Active] = LoadIcon("tray-active.ico");
+        _icons[ManagerStatus.Error] = LoadIcon("tray-error.ico");
     }
 
-    private static (Icon, IntPtr) MakeIcon(Color tint)
+    // Picks the embedded size closest to the tray's current icon size, so it stays sharp at any DPI.
+    private static Icon LoadIcon(string resource)
     {
-        using var bmp = new Bitmap(32, 32, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Color.Transparent);
-            using var body = new SolidBrush(tint);
-            g.FillEllipse(body, 1, 9, 15, 15);
-            g.FillEllipse(body, 16, 9, 15, 15);
-            g.FillRectangle(body, 8, 10, 16, 13);
-            using var hole = new SolidBrush(Color.FromArgb(235, 250, 250, 250));
-            g.FillEllipse(hole, 6, 14, 5, 5);
-            g.FillEllipse(hole, 21, 14, 5, 5);
-        }
-        IntPtr h = bmp.GetHicon();
-        return ((Icon)Icon.FromHandle(h), h);
+        using var stream = typeof(TrayAppContext).Assembly.GetManifestResourceStream(resource)
+            ?? throw new InvalidOperationException("Missing embedded icon " + resource);
+        return new Icon(stream, SystemInformation.SmallIconSize);
     }
 
     private void ExitApp()
@@ -215,10 +202,9 @@ internal sealed class TrayAppContext : ApplicationContext
         }
         catch { }
 
-        foreach (var (icon, handle) in _icons.Values)
+        foreach (var icon in _icons.Values)
         {
             try { icon.Dispose(); } catch { }
-            try { NativeMethods.DestroyIcon(handle); } catch { }
         }
         _icons.Clear();
 

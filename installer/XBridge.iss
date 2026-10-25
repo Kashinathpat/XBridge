@@ -3,7 +3,7 @@
 
 #define AppName       "XBridge"
 #define AppShortName  "XBridge"
-#define AppVersion    "2.0.0"
+#define AppVersion    "2.1.0"
 #define AppPublisher  "XBridge"
 #define AppExe        "XBridge.exe"
 #define PublishDir    "..\publish"
@@ -26,6 +26,7 @@ DefaultDirName={autopf}\{#AppShortName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
+SetupIconFile=..\src\Assets\XBridge.ico
 OutputBaseFilename={#AppShortName}-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes

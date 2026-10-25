@@ -3,8 +3,9 @@
 A Windows system-tray app (.NET 8) that turns up to **four** gamepads into virtual
 **Xbox 360** controllers, and hides the physical pads from every other app via
 **HidHide** so games see only the Xbox pad. Which controllers it bridges is set by
-a VID/PID list in `config.json` (the wired DragonRise pad — USB VID 0079 / PID
-0006, sold as Speedlink Strike — is enabled by default).
+a VID/PID list in `config.json`. Enabled by default: the wired DragonRise pad (USB
+VID 0079 / PID 0006, sold as Speedlink Strike) and a phone acting as a Bluetooth
+gamepad (the BluetoothPad app, VID 038F / PID 1200).
 
 It has no window — it lives in the notification area. The tray icon shows state:
 **grey** = no controllers, **green** = N active, **red** = an error.
@@ -31,19 +32,21 @@ It has no window — it lives in the notification area. The tray icon shows stat
 
 ## Requirements
 
-- Windows 10 or 11, 64-bit.
-- **ViGEmBus** and **HidHide** drivers — bundled in the installer, installed only
-  if missing.
-- **.NET 8 Desktop Runtime (x64)** — not bundled; the installer downloads and
-  installs it if missing.
+Windows 10 or 11, 64-bit.
 
 ## Install
 
-Run `XBridge-Setup-2.0.0.exe`. It installs the app to `%ProgramFiles%\XBridge`,
-installs any missing driver / runtime, registers the app on HidHide's allow-list,
-and sets it to start at sign-in. **Reboot when it asks** if it just installed a
-driver — HidHide only starts hiding a pad after its device stack is rebuilt (a
-reboot, or unplug/replug of the pad).
+Run `XBridge-Setup-x.x.x.exe`. It installs the app to `%ProgramFiles%\XBridge`,
+installs the ViGEmBus and HidHide drivers and the .NET 8 Desktop Runtime if they
+are missing, registers the app on HidHide's allow-list, and sets it to start at
+sign-in. The drivers are bundled; the .NET runtime is downloaded, so the first
+install needs internet only if .NET 8 is not already on the PC.
+
+**Reboot when it asks** if it just installed a driver — HidHide only starts hiding
+a pad after its device stack is rebuilt (a reboot, or unplug/replug of the pad).
+
+`XBridge.exe` on its own does not install any of this: it needs .NET 8 and both
+drivers already present.
 
 ## Use
 
@@ -60,7 +63,8 @@ Command-line options (framework-dependent build — `XBridge.exe <flag>`):
 
 ## Configuration — `%LocalAppData%\XBridge\`
 
-`config.json` is created with defaults on first run. The keys most worth knowing:
+`config.json` is created with defaults on first run. Changes take effect after you
+quit XBridge from the tray icon and start it again. The keys most worth knowing:
 
 | key | default | meaning |
 |---|---|---|
@@ -102,4 +106,4 @@ installer\build.cmd
 Output: `publish\XBridge.exe`. To build the installer, also put
 `ViGEmBusSetup_x64.exe` and `HidHideSetup_x64.exe` in `installer\redist\` (see
 that folder's `README.txt`) and have Inno Setup 6 on `PATH`; `build.cmd` then
-compiles `installer\Output\XBridge-Setup-2.0.0.exe`.
+compiles `installer\Output\XBridge-Setup-x.x.x.exe`.

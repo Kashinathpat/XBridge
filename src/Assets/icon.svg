@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="10 -64 520 520" width="512" height="512">
+  <defs>
+    <!-- Everything the arch shadow can fall on: both side bars and both diagonals -->
+    <mask id="receivers" maskUnits="userSpaceOnUse" x="0" y="0" width="540" height="400">
+      <g fill="none" stroke="#fff" stroke-width="84" stroke-linecap="round">
+        <path d="M 152 50 Q 64 172 60 342" />
+        <path d="M 388 50 Q 476 172 480 342" />
+        <line x1="388" y1="50" x2="116" y2="274" />
+        <line x1="152" y1="50" x2="424" y2="274" />
+      </g>
+    </mask>
+
+    <mask id="mask-diag-back">
+      <line x1="388" y1="50" x2="116" y2="274" stroke="white" stroke-width="84" stroke-linecap="round" />
+    </mask>
+
+    <!-- The lower halves of the side bars sit in front of the diagonal ends -->
+    <clipPath id="clip-lower-left">
+      <rect x="0" y="160" width="270" height="240" />
+    </clipPath>
+    <clipPath id="clip-lower-right">
+      <rect x="270" y="160" width="270" height="240" />
+    </clipPath>
+  </defs>
+
+  <g fill="none" stroke-linecap="round">
+    <!-- 1. Side bars (tops sit behind the diagonal caps) -->
+    <path d="M 152 50 Q 64 172 60 342" stroke="#36B341" stroke-width="84" />
+    <path d="M 388 50 Q 476 172 480 342" stroke="#36B341" stroke-width="84" />
+
+    <!-- 2. Back diagonal, with the shadow the front diagonal casts on it -->
+    <line x1="388" y1="50" x2="116" y2="274" stroke="#E5FCE7" stroke-width="84" />
+    <g mask="url(#mask-diag-back)">
+      <line x1="162.2" y1="37.6" x2="434.2" y2="261.6" stroke="#0B3D12" stroke-opacity="0.25" stroke-width="116" />
+    </g>
+
+    <!-- 3. Front diagonal -->
+    <line x1="152" y1="50" x2="424" y2="274" stroke="#E5FCE7" stroke-width="84" />
+
+    <!-- 4. Lower side bars back in front of the diagonal ends -->
+    <g clip-path="url(#clip-lower-left)">
+      <path d="M 152 50 Q 64 172 60 342" stroke="#36B341" stroke-width="84" />
+    </g>
+    <g clip-path="url(#clip-lower-right)">
+      <path d="M 388 50 Q 476 172 480 342" stroke="#36B341" stroke-width="84" />
+    </g>
+
+    <!-- 5. Arch shadow: one stroke over everything it touches, so the edge is continuous -->
+    <g mask="url(#receivers)">
+      <path d="M 60 326 Q 270 136 480 326" stroke="#0B3D12" stroke-opacity="0.25" stroke-width="116" />
+    </g>
+
+    <!-- 6. Foreground arch -->
+    <path d="M 60 342 Q 270 152 480 342" stroke="#42D452" stroke-width="84" />
+  </g>
+</svg>

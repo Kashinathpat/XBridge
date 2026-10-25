@@ -8,10 +8,6 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool AllocConsole();
 
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool DestroyIcon(IntPtr hIcon);
-
     public const int WM_DEVICECHANGE = 0x0219;
     public const int DBT_DEVICEARRIVAL = 0x8000;
     public const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
