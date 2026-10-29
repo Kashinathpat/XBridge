@@ -43,7 +43,7 @@ internal sealed class SessionManager
     private bool _disposed => Volatile.Read(ref _disposedFlag) != 0;
 
     public event Action<ManagerState>? StateChanged;
-    public Action<string, string, bool>? Notify { get; set; }   // title, body, isError -> tray balloon
+    public Action<string, string>? Notify { get; set; }   // title, body -> tray balloon
 
     public SessionManager(AppConfig cfg, HidHideManager hidHide, string ownExe)
     {
@@ -233,7 +233,7 @@ internal sealed class SessionManager
                 if (session.RawInputVisible && _warnedRawInput.Add(key))
                     Notify?.Invoke("Reconnect controller once",
                         $"\"{unit.ProductName.Trim()}\" was connected before XBridge hid it, so browsers can still see it. " +
-                        "Disconnect and reconnect it once; after that it stays hidden.", false);
+                        "Disconnect and reconnect it once; after that it stays hidden.");
             }
             catch (SessionStartException ex)
             {
@@ -245,12 +245,12 @@ internal sealed class SessionManager
                 {
                     // e.g. HidHide driver momentarily held by another app - retry soon, don't alarm.
                     _cooldownUntil[key] = DateTime.UtcNow.AddSeconds(3);
-                    if (_warnedTransient.Add(key)) Notify?.Invoke("Waiting on HidHide", firstLine, false);
+                    if (_warnedTransient.Add(key)) Notify?.Invoke("Waiting on HidHide", firstLine);
                 }
                 else
                 {
                     _cooldownUntil[key] = DateTime.UtcNow.AddSeconds(_cfg.FaultCooldownSeconds);
-                    Notify?.Invoke("Controller not started", firstLine, true);
+                    Notify?.Invoke("Controller not started", firstLine);
                 }
 
                 if (IsViGEmBusGone(ex))
@@ -316,8 +316,7 @@ internal sealed class SessionManager
             Notify?.Invoke("ViGEmBus unavailable",
                 d.Installed && !d.Running
                     ? "The ViGEmBus service is installed but stopped - 'sc start ViGEmBus' or reboot, then reconnect the pad."
-                    : "The ViGEmBus driver is not installed - reinstall ViGEmBusSetup_x64.msi, then reconnect the pad.",
-                true);
+                    : "The ViGEmBus driver is not installed - reinstall ViGEmBusSetup_x64.msi, then reconnect the pad.");
             return false;
         }
     }

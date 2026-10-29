@@ -46,7 +46,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _hidHide = new HidHideManager(cfg.Devices);
         _manager = new SessionManager(cfg, _hidHide, ownExe)
         {
-            Notify = (title, body, isError) => ShowBalloon(title, body, isError ? ToolTipIcon.Error : ToolTipIcon.Info),
+            Notify = (title, body) => ShowBalloon(title, body),
         };
         _manager.StateChanged += OnManagerStateChanged;
 
@@ -109,12 +109,10 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (!vigem.Installed)
             ShowBalloon("ViGEmBus not installed",
-                "Controller emulation needs the ViGEmBus driver. Reinstall ViGEmBusSetup_x64.msi. Emulation is paused.",
-                ToolTipIcon.Error);
+                "Controller emulation needs the ViGEmBus driver. Reinstall ViGEmBusSetup_x64.msi. Emulation is paused.");
         else if (!vigem.Running)
             ShowBalloon("ViGEmBus not running",
-                "The ViGEmBus service is installed but stopped. Run 'sc start ViGEmBus' or reboot.",
-                ToolTipIcon.Warning);
+                "The ViGEmBus service is installed but stopped. Run 'sc start ViGEmBus' or reboot.");
 
         switch (access)
         {
@@ -123,25 +121,27 @@ internal sealed class TrayAppContext : ApplicationContext
             case HidHideAccess.NotInstalled:
                 ShowBalloon("HidHide not installed",
                     "The HidHide driver was not found. Install HidHideMSI_x64.msi. " +
-                    "Sessions will not start while RequireCloak=true (config.json).", ToolTipIcon.Warning);
+                    "Sessions will not start while RequireCloak=true (config.json).");
                 break;
             case HidHideAccess.ServiceUnavailable:
-                ShowBalloon("HidHide service problem", accessDetail, ToolTipIcon.Warning);
+                ShowBalloon("HidHide service problem", accessDetail);
                 break;
             case HidHideAccess.AccessDenied:
-                ShowBalloon("HidHide unavailable", accessDetail, ToolTipIcon.Warning);
+                ShowBalloon("HidHide unavailable", accessDetail);
                 break;
             default:
-                ShowBalloon("HidHide check failed", accessDetail, ToolTipIcon.Warning);
+                ShowBalloon("HidHide check failed", accessDetail);
                 break;
         }
     }
 
-    private void ShowBalloon(string title, string body, ToolTipIcon icon)
+    private void ShowBalloon(string title, string body)
     {
         void Do()
         {
-            try { _tray.ShowBalloonTip(4000, title, body, icon); }
+            // WinForms only exposes Windows' stock severity glyphs here; omit them so notifications
+            // are branded by the app icon instead of showing a generic orange X or warning symbol.
+            try { _tray.ShowBalloonTip(4000, title, body, ToolTipIcon.None); }
             catch (Exception ex) { Log.Warn("balloon failed: " + ex.Message); }
         }
         try

@@ -18,8 +18,8 @@
     <RootNamespace>XBridge</RootNamespace>
     <AssemblyTitle>XBridge</AssemblyTitle>
     <Product>XBridge</Product>
-    <Version>2.1.0</Version>
-    <InformationalVersion>2.1.0</InformationalVersion>
+    <Version>2.2.0</Version>
+    <InformationalVersion>2.2.0</InformationalVersion>
     <Description>Emulates Xbox 360 controllers (with rumble) from HID gamepads and hides the physical devices via HidHide.</Description>
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
