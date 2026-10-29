@@ -93,7 +93,7 @@ internal static class Program
 
     private static int HidHideCleanup(AppConfig cfg)
     {
-        NativeMethods.AllocConsole();
+        NativeMethods.EnsureConsole();
         Log.EnableConsoleMirror();
         Log.Info("Running one-shot HidHide cleanup (--cloak-off / --hidhide-cleanup).");
 
@@ -117,7 +117,7 @@ internal static class Program
 
     private static int HidHideRegister(AppConfig cfg)
     {
-        NativeMethods.AllocConsole();
+        NativeMethods.EnsureConsole();
         Log.EnableConsoleMirror();
         Log.Info("Running one-shot HidHide app registration (--hidhide-register).");
 
@@ -129,13 +129,16 @@ internal static class Program
 
     private static int RunCalibrate(string[] args, AppConfig cfg)
     {
-        NativeMethods.AllocConsole();
+        bool allocated = NativeMethods.EnsureConsole();
         try
         {
             CalibrationRunner.Run(args, cfg);
-            Console.WriteLine();
-            Console.WriteLine("Press Enter to close.");
-            try { Console.ReadLine(); } catch { }
+            if (allocated)
+            {
+                Console.WriteLine();
+                Console.WriteLine("Press Enter to close.");
+                try { Console.ReadLine(); } catch { }
+            }
             return 0;
         }
         catch (Exception ex)
@@ -148,7 +151,7 @@ internal static class Program
 
     private static int ShowHelp()
     {
-        NativeMethods.AllocConsole();
+        bool allocated = NativeMethods.EnsureConsole();
         Console.WriteLine(
             """
             XBridge - emulates Xbox 360 controllers (with rumble) from up to four
@@ -172,9 +175,12 @@ internal static class Program
               hidden-devices.txt       pads XBridge has hidden, so --cloak-off can un-hide them
               logs\app.log             rolling, size-capped diagnostic log
             """);
-        Console.WriteLine();
-        Console.WriteLine("Press Enter to close.");
-        try { Console.ReadLine(); } catch { }
+        if (allocated)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Press Enter to close.");
+            try { Console.ReadLine(); } catch { }
+        }
         return 0;
     }
 

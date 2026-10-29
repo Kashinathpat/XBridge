@@ -1,9 +1,9 @@
-using System.Management;
 using System.Text.RegularExpressions;
 using Nefarius.Drivers.HidHide;
 using Nefarius.Drivers.HidHide.Exceptions;
 using XBridge.Config;
 using XBridge.Diagnostics;
+using XBridge.Interop;
 
 namespace XBridge.Core;
 
@@ -126,18 +126,20 @@ internal sealed class HidHideManager
         var mv = VidRe.Match(instanceId);
         var mp = PidRe.Match(instanceId);
         if (!mv.Success || !mp.Success) return false;
-        vid = (ushort)(Convert.ToUInt32(mv.Groups[1].Value, 16) & 0xFFFF);
-        pid = (ushort)(Convert.ToUInt32(mp.Groups[1].Value, 16) & 0xFFFF);
+        if (!uint.TryParse(mv.Groups[1].Value, System.Globalization.NumberStyles.HexNumber, null, out var rawV)) return false;
+        if (!uint.TryParse(mp.Groups[1].Value, System.Globalization.NumberStyles.HexNumber, null, out var rawP)) return false;
+        vid = (ushort)(rawV & 0xFFFF);
+        pid = (ushort)(rawP & 0xFFFF);
         return true;
     }
 
-    private static readonly object WmiGate = new();
+    private static readonly object PnpGate = new();
     private static List<string>? _cachedPnpIds;
 
-    // Present HID PnP instance ids for the configured devices (WMI - sees cloaked devices too).
+    // Present HID PnP instance ids for the configured devices (CfgMgr32 - sees cloaked devices too).
     public static IReadOnlyList<string> EnumerateInstancePaths(IReadOnlyList<DeviceId> devices, bool forceRefresh = false)
     {
-        lock (WmiGate)
+        lock (PnpGate)
         {
             if (!forceRefresh && _cachedPnpIds is not null)
                 return _cachedPnpIds;
@@ -145,16 +147,21 @@ internal sealed class HidHideManager
             var list = new List<string>();
             try
             {
-                using var searcher = new ManagementObjectSearcher(
-                    "root\\CIMV2", "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE 'HID\\\\%'");
-                using var results = searcher.Get();
-                foreach (ManagementBaseObject mo in results)
+                var allIds = NativeMethods.GetPresentHidDeviceIds();
+                if (allIds is null)
                 {
-                    if (mo["DeviceID"] is string id && id.Length > 0
+                    Log.Warn("CfgMgr32 enumeration of present HID device ids failed; preserving cache.");
+                    return _cachedPnpIds ?? list;
+                }
+
+                foreach (string id in allIds)
+                {
+                    if (id.Length > 0
                         && TryExtractVidPid(id, out var v, out var p)
                         && devices.Any(d => d.Matches(v, p)))
+                    {
                         list.Add(id);
-                    mo.Dispose();
+                    }
                 }
                 list.Sort(StringComparer.OrdinalIgnoreCase);
                 _cachedPnpIds = list;
@@ -162,7 +169,7 @@ internal sealed class HidHideManager
             }
             catch (Exception ex)
             {
-                Log.Error("WMI enumeration of HidHide instance ids failed", ex);
+                Log.Error("CfgMgr32 enumeration of HidHide instance ids failed", ex);
                 return _cachedPnpIds ?? list;
             }
         }
@@ -252,8 +259,7 @@ internal sealed class HidHideManager
             if (!owned.Add(instanceId)) return true;
             try
             {
-                Directory.CreateDirectory(AppConfig.ConfigDir);
-                File.WriteAllLines(OwnedPath, owned);
+                AtomicFile.WriteAllLines(OwnedPath, owned);
                 return true;
             }
             catch (Exception ex)

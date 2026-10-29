@@ -2,8 +2,8 @@ using HidSharp;
 using XBridge.Config;
 using XBridge.Core;
 using XBridge.Diagnostics;
+using XBridge.Input;
 using XBridge.Interop;
-using Vortice.DirectInput;
 
 namespace XBridge.Calibration;
 
@@ -23,7 +23,7 @@ internal static class CalibrationRunner
         int wantIndex = ArgInt(args, "--index", -1);
         Guid wantGuid = ArgGuid(args, "--guid");
 
-        var units = DevicePairer.Enumerate(cfg.Devices).Where(u => u.HasHidPath).ToList();
+        var units = DevicePairer.Enumerate(cfg.Devices).ToList();
         if (units.Count == 0)
         {
             Console.WriteLine("None of the config.json Devices are attached.");
@@ -32,13 +32,13 @@ internal static class CalibrationRunner
 
         for (int i = 0; i < units.Count; i++)
             Console.WriteLine($"  [{i}] {units[i].ProductName.Trim()}  VID {units[i].Vid:X4}/PID {units[i].Pid:X4}  " +
-                              $"InstanceGuid={units[i].DiInstanceGuid}");
+                              $"InstanceGuid={units[i].InstanceGuid}");
         Console.WriteLine();
 
-        int byGuid = wantGuid != Guid.Empty ? units.FindIndex(u => u.DiInstanceGuid == wantGuid) : -1;
+        int byGuid = wantGuid != Guid.Empty ? units.FindIndex(u => u.InstanceGuid == wantGuid) : -1;
         int pick = byGuid >= 0 ? byGuid : wantIndex >= 0 && wantIndex < units.Count ? wantIndex : 0;
         var unit = units[pick];
-        Console.WriteLine($"Using [{pick}] {unit.ProductName.Trim()}  {unit.DiInstanceGuid}");
+        Console.WriteLine($"Using [{pick}] {unit.ProductName.Trim()}  {unit.InstanceGuid}");
         Console.WriteLine("(pass --index N or --guid <instance-guid> to pick another)");
         Console.WriteLine();
 
@@ -58,7 +58,6 @@ internal static class CalibrationRunner
             Console.WriteLine(new string('-', 64));
 
             var state = new JoystickState();
-            Array.Fill(state.PointOfViewControllers, -1);
             bool[] prevButtons = new bool[128];
             int prevPov = int.MinValue;
             int[] prevAxes = { int.MinValue, 0, 0, 0, 0, 0 };

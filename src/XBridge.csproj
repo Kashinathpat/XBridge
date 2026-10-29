@@ -18,8 +18,8 @@
     <RootNamespace>XBridge</RootNamespace>
     <AssemblyTitle>XBridge</AssemblyTitle>
     <Product>XBridge</Product>
-    <Version>2.3.0</Version>
-    <InformationalVersion>2.3.0</InformationalVersion>
+    <Version>2.4.0</Version>
+    <InformationalVersion>2.4.0</InformationalVersion>
     <Description>Emulates Xbox 360 controllers (with rumble) from HID gamepads and hides the physical devices via HidHide.</Description>
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
@@ -32,11 +32,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Vortice.DirectInput" Version="3.6.2" />
     <PackageReference Include="Nefarius.ViGEm.Client" Version="1.21.256" />
     <PackageReference Include="Nefarius.Drivers.HidHide" Version="3.4.0" />
     <PackageReference Include="HidSharp" Version="2.1.0" />
-    <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
   </ItemGroup>
 

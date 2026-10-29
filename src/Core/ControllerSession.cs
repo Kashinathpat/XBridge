@@ -7,7 +7,6 @@ using XBridge.Config;
 using XBridge.Diagnostics;
 using XBridge.Input;
 using XBridge.Interop;
-using Vortice.DirectInput;
 
 namespace XBridge.Core;
 
@@ -25,7 +24,7 @@ internal sealed class SessionStartException : Exception
 // FeedbackReceived only stages bytes for this session's HID handle, so rumble can't cross to another unit.
 internal sealed class ControllerSession : IDisposable
 {
-    public Guid InstanceGuid => _unit.DiInstanceGuid;
+    public Guid InstanceGuid => _unit.InstanceGuid;
     public string ProductName => _unit.ProductName;
     public SessionStatus Status => _status;
     public string? FaultReason { get; private set; }
@@ -87,7 +86,7 @@ internal sealed class ControllerSession : IDisposable
     public void Start()
     {
         Log.Info($"[{ShortId}] session CREATED guid={InstanceGuid} name=\"{ProductName}\" " +
-                 $"pairing={_unit.MatchKind} hid={_unit.HidDevicePath ?? "<none>"} cloak={_unit.HidHideInstancePath ?? "<none>"}");
+                 $"hid={_unit.HidDevicePath} cloak={_unit.HidHideInstancePath ?? "<none>"}");
         try
         {
             OpenRumbleHandleStep();
@@ -117,16 +116,13 @@ internal sealed class ControllerSession : IDisposable
 
     private void OpenRumbleHandleStep()
     {
-        if (string.IsNullOrEmpty(_unit.HidDevicePath))
-            throw new SessionStartException("No raw HID device found for this unit.");
-
         if (_unit.HidMaxOutputLength <= 0)
         {
             Log.Info($"[{ShortId}] HID device has no output report - input-only (this device can't rumble)");
             return;
         }
 
-        _rumble = NativeHid.OpenForWrite(_unit.HidDevicePath!, out string? err);
+        _rumble = NativeHid.OpenForWrite(_unit.HidDevicePath, out string? err);
         if (_rumble is not null && !_rumble.IsInvalid)
         {
             Log.Info($"[{ShortId}] rumble HID handle open");
@@ -161,7 +157,7 @@ internal sealed class ControllerSession : IDisposable
         _cloaked = _hidHide.CloakDevice(_unit.HidHideInstancePath, _ownExe);
         if (_cloaked)
         {
-            if (_unit.HasHidPath && RawInputDevices.IsListed(_unit.HidDevicePath!))
+            if (RawInputDevices.IsListed(_unit.HidDevicePath))
             {
                 RawInputVisible = true;
                 Log.Warn($"[{ShortId}] device was already present before it was hidden - RawInput apps " +
@@ -205,8 +201,6 @@ internal sealed class ControllerSession : IDisposable
         if (!OpenHidReader())
             throw new SessionStartException("Could not open the raw-HID input device (in use, or blocked by HidHide).");
 
-        // JoystickState defaults every POV to 0 (north); a pad without a hat must read centred.
-        Array.Fill(_state.PointOfViewControllers, -1);
         Log.Info($"[{ShortId}] raw HID input stream open ({_rxInput.Length}-byte reports)");
     }
 
@@ -226,7 +220,7 @@ internal sealed class ControllerSession : IDisposable
     {
         try { ReadLoop(); }
         catch (Exception ex) when (!_stop) { Fault($"Input thread failed: {ex.Message}"); }
-        catch { }   // shutdown disposed the stream, parser or pad under the loop
+        catch (Exception ex) { Log.Debug($"[{ShortId}] ReadThread shutdown: {ex.Message}"); }
     }
 
     private void ReadLoop()

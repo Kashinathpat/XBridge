@@ -1,5 +1,4 @@
 using XBridge.Config;
-using Vortice.DirectInput;
 
 namespace XBridge.Input;
 
@@ -92,7 +91,7 @@ internal sealed class InputMapper
 
     private static bool Get(bool[] b, int i) => i >= 0 && i < b.Length && b[i];
 
-    private static int AxisRaw(JoystickState s, int idx) => idx switch
+    private int AxisRaw(JoystickState s, int idx) => idx switch
     {
         0 => s.X,
         1 => s.Y,
@@ -100,7 +99,7 @@ internal sealed class InputMapper
         3 => s.RotationX,
         4 => s.RotationY,
         5 => s.RotationZ,
-        _ => 0,
+        _ => (int)_axisMid,
     };
 
     private double Norm(int raw) => Math.Clamp((raw - _axisMid) / _axisHalf, -1.0, 1.0);

@@ -16,12 +16,10 @@ internal readonly record struct ManagerState(ManagerStatus Status, int ActiveCou
 internal sealed class SessionManager
 {
     private readonly object _lock = new();
-    // Keyed by KeyOf() (the HID device path) not the DI InstanceGuid, which DirectInput
-    // reshuffles among identical VID/PID units on every plug/unplug.
+    // Keyed by KeyOf() (the HID device path).
     private readonly Dictionary<string, ControllerSession> _sessions = new();
     private readonly Dictionary<string, DateTime> _cooldownUntil = new();
     private readonly Dictionary<string, int> _missingPasses = new();
-    private readonly Dictionary<Guid, int> _unpairedPasses = new();   // pre-pairing retry counter - guid is all we have
     private readonly HashSet<string> _warnedTransient = new();
     private readonly HashSet<string> _warnedRawInput = new();
     private readonly Dictionary<(ushort vid, ushort pid), InputMapper> _mappers = new();
@@ -125,13 +123,11 @@ internal sealed class SessionManager
         }
     }
 
-    // Stable per-slot identity: the HID device path (USB-port derived). Falls back to the DI
-    // guid only for a not-yet-paired unit, which has no HID path.
-    private static string KeyOf(GamepadUnit u) =>
-        u.HasHidPath ? u.HidDevicePath!.Trim().ToLowerInvariant() : "di:" + u.DiInstanceGuid;
+    // Stable per-slot identity: the HID device path (USB-port derived).
+    private static string KeyOf(GamepadUnit u) => u.HidDevicePath.Trim().ToLowerInvariant();
 
     private bool HasPending(DateTime now) =>
-        _unpairedPasses.Count > 0 || _missingPasses.Count > 0 || _cooldownUntil.Values.Any(u => u > now);
+        _missingPasses.Count > 0 || _cooldownUntil.Values.Any(u => u > now);
 
     private void ReconcileOnce(string trigger)
     {
@@ -143,10 +139,6 @@ internal sealed class SessionManager
         var present = DevicePairer.Enumerate(_cfg.Devices, allHealthy, forceRefresh, hasPending, _sessions.Count > 0);
         var presentByKey = new Dictionary<string, GamepadUnit>();
         foreach (var u in present) presentByKey[KeyOf(u)] = u;
-
-        var presentGuids = new HashSet<Guid>(present.Select(p => p.DiInstanceGuid));
-        foreach (var g in _unpairedPasses.Keys.ToArray())
-            if (!presentGuids.Contains(g)) _unpairedPasses.Remove(g);
 
         foreach (var (k, until) in _cooldownUntil.ToArray())
             if (until <= now || !presentByKey.ContainsKey(k)) _cooldownUntil.Remove(k);
@@ -192,7 +184,7 @@ internal sealed class SessionManager
                 continue;
             }
 
-            // Absent from enumeration - a few consecutive misses before tearing down (enum can be racy).
+            // Absent from enumeration - a few consecutive misses before tearing down (absorbs transient enumeration hiccups).
             int n = _missingPasses[key] = _missingPasses.GetValueOrDefault(key) + 1;
             if (n < _cfg.AbsenceGracePasses)
             {
@@ -214,7 +206,7 @@ internal sealed class SessionManager
         foreach (var unit in present)
         {
             string key = KeyOf(unit);
-            Guid guid = unit.DiInstanceGuid;
+            Guid guid = unit.InstanceGuid;
             if (_sessions.ContainsKey(key)) continue;
             if (_cooldownUntil.ContainsKey(key)) continue;
 
@@ -224,31 +216,12 @@ internal sealed class SessionManager
                 continue;
             }
 
-            // A fresh unit's DI<->HID pairing can take a few reconciles to resolve after a
-            // hot-plug - don't hard-fail it (balloon + 15s cooldown) until it's been "none" a while.
-            if (unit.MatchKind == "none")
-            {
-                int u = _unpairedPasses[guid] = _unpairedPasses.GetValueOrDefault(guid) + 1;
-                if (u < _cfg.PairRetryPasses)
-                {
-                    Log.Info($"Reconcile({trigger}): {Short(guid)} not yet paired to a raw HID device ({u}/{_cfg.PairRetryPasses}) - retrying");
-                    continue;
-                }
-                Log.Warn($"Reconcile({trigger}): {Short(guid)} still unpaired after {u} passes.");
-                _unpairedPasses.Remove(guid);
-            }
-            else
-            {
-                _unpairedPasses.Remove(guid);
-            }
-
             var session = new ControllerSession(unit, _client!, MapperFor(unit.Vid, unit.Pid),
                 _cfg, _hidHide, _ownExe, OnSessionFaulted);
             try
             {
                 session.Start();
                 _sessions[key] = session;
-                _unpairedPasses.Remove(guid);
                 _warnedTransient.Remove(key);
                 if (session.RawInputVisible && _warnedRawInput.Add(key))
                     Notify?.Invoke("Reconnect controller once",
@@ -304,7 +277,7 @@ internal sealed class SessionManager
         }
 
         int dueMs;
-        if (_unpairedPasses.Count > 0 || _missingPasses.Count > 0)
+        if (_missingPasses.Count > 0)
         {
             dueMs = 3000;
         }
@@ -333,7 +306,6 @@ internal sealed class SessionManager
         _sessions.Remove(key);
         _missingPasses.Remove(key);
         _warnedTransient.Remove(key);
-        _unpairedPasses.Remove(session.InstanceGuid);
         try { session.Dispose(); }
         catch (Exception ex) { Log.Error($"Reconcile: dispose of {Short(session.InstanceGuid)} threw", ex); }
     }

@@ -24,8 +24,7 @@ internal sealed class DeviceId
         ushort.TryParse((s ?? "").Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
 }
 
-// Runtime knobs, persisted to %LocalAppData%\XBridge\config.json and
-// rewritten with defaults on load so new keys appear in the user's file.
+// Runtime knobs, persisted to %LocalAppData%\XBridge\config.json (user edits survive).
 internal sealed class AppConfig
 {
     // controllers to bridge, by USB VID/PID (4 hex digits). Add an entry per new pad.
@@ -47,10 +46,8 @@ internal sealed class AppConfig
     public int ReenumerateSeconds { get; set; } = 30;
     // debounce window for WM_DEVICECHANGE bursts, ms
     public int DeviceChangeDebounceMs { get; set; } = 400;
-    // consecutive enumerations a running session may be missing before it's torn down (DI enum is racy during hot-plug)
+    // consecutive enumerations a running session may be missing before it's torn down (absorbs transient enumeration hiccups)
     public int AbsenceGracePasses { get; set; } = 3;
-    // reconciles to wait for a new unit's DI<->HID pairing to resolve before reporting it can't be paired
-    public int PairRetryPasses { get; set; } = 6;
     // re-assert the HidHide block for running sessions this often, seconds (0 = off); guards against HidHide state drift
     public int CloakReassertSeconds { get; set; } = 120;
 
@@ -98,7 +95,6 @@ internal sealed class AppConfig
             var cfg = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigPath), JsonOpts)
                       ?? throw new JsonException("the file contains null");
             cfg.Clamp();
-            cfg.Save();
             Log.Info($"Config loaded from {ConfigPath}");
             return cfg;
         }
@@ -114,8 +110,7 @@ internal sealed class AppConfig
     {
         try
         {
-            Directory.CreateDirectory(ConfigDir);
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(this, JsonOpts));
+            AtomicFile.WriteAllText(ConfigPath, JsonSerializer.Serialize(this, JsonOpts));
         }
         catch (Exception ex)
         {
@@ -139,7 +134,6 @@ internal sealed class AppConfig
         ReenumerateSeconds = Math.Clamp(ReenumerateSeconds, 1, 120);
         DeviceChangeDebounceMs = Math.Clamp(DeviceChangeDebounceMs, 50, 5000);
         AbsenceGracePasses = Math.Clamp(AbsenceGracePasses, 1, 20);
-        PairRetryPasses = Math.Clamp(PairRetryPasses, 1, 60);
         CloakReassertSeconds = Math.Clamp(CloakReassertSeconds, 0, 600);
         RumbleRepeat = Math.Clamp(RumbleRepeat, 1, 20);
         RumbleKeepAliveMs = Math.Clamp(RumbleKeepAliveMs, 100, 10000);

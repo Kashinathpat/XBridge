@@ -1,8 +1,8 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
-using Vortice.DirectInput;
 using XBridge.Diagnostics;
+using XBridge.Input;
 
 namespace XBridge.Interop;
 
@@ -11,19 +11,8 @@ namespace XBridge.Interop;
 internal sealed class HidInputParser : IDisposable
 {
     private const int HidP_Input = 0;
-    private const int HIDP_STATUS_SUCCESS = 0x00110000;
     private const ushort PageGenericDesktop = 0x01;
     private const ushort PageButton = 0x09;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct HIDP_CAPS
-    {
-        public ushort Usage, UsagePage, InputReportByteLength, OutputReportByteLength, FeatureReportByteLength;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)] public ushort[] Reserved;
-        public ushort NumberLinkCollectionNodes, NumberInputButtonCaps, NumberInputValueCaps, NumberInputDataIndices,
-            NumberOutputButtonCaps, NumberOutputValueCaps, NumberOutputDataIndices,
-            NumberFeatureButtonCaps, NumberFeatureValueCaps, NumberFeatureDataIndices;
-    }
 
     [StructLayout(LayoutKind.Explicit, Size = 72)]
     private struct HIDP_VALUE_CAPS
@@ -39,23 +28,6 @@ internal sealed class HidInputParser : IDisposable
         [FieldOffset(56)] public ushort UsageMin;   // NotRange.Usage when IsRange == 0
         [FieldOffset(58)] public ushort UsageMax;
     }
-
-    private sealed class PreparsedData : SafeHandleZeroOrMinusOneIsInvalid
-    {
-        public PreparsedData() : base(true) { }
-        protected override bool ReleaseHandle() => HidD_FreePreparsedData(handle);
-    }
-
-    [DllImport("hid.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.U1)]
-    private static extern bool HidD_GetPreparsedData(SafeFileHandle device, out PreparsedData preparsed);
-
-    [DllImport("hid.dll")]
-    [return: MarshalAs(UnmanagedType.U1)]
-    private static extern bool HidD_FreePreparsedData(IntPtr preparsed);
-
-    [DllImport("hid.dll")]
-    private static extern int HidP_GetCaps(PreparsedData preparsed, out HIDP_CAPS caps);
 
     [DllImport("hid.dll")]
     private static extern int HidP_GetValueCaps(int reportType, [Out] HIDP_VALUE_CAPS[] caps, ref ushort length, PreparsedData preparsed);
@@ -86,7 +58,7 @@ internal sealed class HidInputParser : IDisposable
         {
             if (h.IsInvalid)
                 throw new IOException("Could not open the HID device: " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-            if (!HidD_GetPreparsedData(h, out _preparsed))
+            if (!NativeHid.HidD_GetPreparsedData(h, out _preparsed))
             {
                 int err = Marshal.GetLastWin32Error();
                 _preparsed.Dispose();
@@ -96,14 +68,14 @@ internal sealed class HidInputParser : IDisposable
 
         try
         {
-            if (HidP_GetCaps(_preparsed, out var caps) != HIDP_STATUS_SUCCESS)
+            if (NativeHid.HidP_GetCaps(_preparsed, out var caps) != NativeHid.HIDP_STATUS_SUCCESS)
                 throw new IOException("Could not parse the HID descriptor.");
             ReportLength = caps.InputReportByteLength;
             _pressed = new ushort[Math.Max(1, HidP_MaxUsageListLength(HidP_Input, PageButton, _preparsed))];
 
             var valueCaps = new HIDP_VALUE_CAPS[caps.NumberInputValueCaps];
             ushort count = (ushort)valueCaps.Length;
-            if (count > 0 && HidP_GetValueCaps(HidP_Input, valueCaps, ref count, _preparsed) != HIDP_STATUS_SUCCESS)
+            if (count > 0 && HidP_GetValueCaps(HidP_Input, valueCaps, ref count, _preparsed) != NativeHid.HIDP_STATUS_SUCCESS)
                 count = 0;
 
             // One usage carrying several values (a value array) has a single JoystickState slot, so only its
@@ -140,7 +112,7 @@ internal sealed class HidInputParser : IDisposable
         // HidP_GetUsages reports only the buttons in this report, so a pad that splits buttons across
         // report IDs would release the others on every report; keep each report's set and merge.
         uint n = (uint)_pressed.Length;
-        if (HidP_GetUsages(HidP_Input, PageButton, 0, _pressed, ref n, _preparsed, report, len) == HIDP_STATUS_SUCCESS)
+        if (HidP_GetUsages(HidP_Input, PageButton, 0, _pressed, ref n, _preparsed, report, len) == NativeHid.HIDP_STATUS_SUCCESS)
         {
             if (!_buttonsByReport.TryGetValue(reportId, out var mine))
                 _buttonsByReport[reportId] = mine = new bool[state.Buttons.Length];
@@ -163,7 +135,7 @@ internal sealed class HidInputParser : IDisposable
         {
             if (f.ReportId != reportId) continue;
             if (HidP_GetUsageValue(HidP_Input, PageGenericDesktop, f.LinkCollection, f.Usage, out uint raw,
-                    _preparsed, report, len) != HIDP_STATUS_SUCCESS)
+                    _preparsed, report, len) != NativeHid.HIDP_STATUS_SUCCESS)
                 continue;
             long v = SignExtend(raw, f.Bits, f.Min);
 

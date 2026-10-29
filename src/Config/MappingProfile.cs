@@ -85,15 +85,7 @@ internal sealed class MappingProfile
         {
             var p = JsonSerializer.Deserialize<MappingProfile>(File.ReadAllText(path), JsonOpts)
                     ?? throw new JsonException("the file contains null");
-            // InputMapper dereferences these on every report; a hand-edited null must not fault every session.
-            if (p.LeftStick is null || p.RightStick is null || p.Buttons is null)
-            {
-                var d = Default(vid, pid);
-                p.LeftStick ??= d.LeftStick;
-                p.RightStick ??= d.RightStick;
-                p.Buttons ??= d.Buttons;
-                Log.Warn($"Mapping {Path.GetFileName(path)}: LeftStick, RightStick or Buttons is missing - using this pad's defaults for it");
-            }
+            p.Validate(vid, pid, Path.GetFileName(path));
             Log.Info($"Mapping loaded from {Path.GetFileName(path)}");
             return p;
         }
@@ -109,13 +101,80 @@ internal sealed class MappingProfile
     {
         try
         {
-            Directory.CreateDirectory(AppConfig.ConfigDir);
-            File.WriteAllText(PathFor(vid, pid), JsonSerializer.Serialize(this, JsonOpts));
+            AtomicFile.WriteAllText(PathFor(vid, pid), JsonSerializer.Serialize(this, JsonOpts));
         }
         catch (Exception ex)
         {
             Log.Error("Mapping save failed", ex);
         }
+    }
+
+    private void Validate(ushort vid, ushort pid, string fileName)
+    {
+        var d = Default(vid, pid);
+        LeftStick ??= d.LeftStick;
+        RightStick ??= d.RightStick;
+        Buttons ??= d.Buttons;
+
+        LeftStick.XAxis = ValidateAxis(fileName, "LeftStick.XAxis", LeftStick.XAxis, d.LeftStick.XAxis);
+        LeftStick.YAxis = ValidateAxis(fileName, "LeftStick.YAxis", LeftStick.YAxis, d.LeftStick.YAxis);
+        RightStick.XAxis = ValidateAxis(fileName, "RightStick.XAxis", RightStick.XAxis, d.RightStick.XAxis);
+        RightStick.YAxis = ValidateAxis(fileName, "RightStick.YAxis", RightStick.YAxis, d.RightStick.YAxis);
+
+        if (!string.Equals(TriggerMode, "Buttons", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(TriggerMode, "ZAxisSplit", StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Warn($"Mapping {fileName}: TriggerMode '{TriggerMode}' is unrecognized - falling back to '{d.TriggerMode}'");
+            TriggerMode = d.TriggerMode;
+        }
+
+        if (string.Equals(TriggerMode, "ZAxisSplit", StringComparison.OrdinalIgnoreCase))
+            ZSplitAxis = ValidateAxis(fileName, "ZSplitAxis", ZSplitAxis, d.ZSplitAxis);
+
+        Buttons.A = ValidateButton(fileName, "Buttons.A", Buttons.A, d.Buttons.A);
+        Buttons.B = ValidateButton(fileName, "Buttons.B", Buttons.B, d.Buttons.B);
+        Buttons.X = ValidateButton(fileName, "Buttons.X", Buttons.X, d.Buttons.X);
+        Buttons.Y = ValidateButton(fileName, "Buttons.Y", Buttons.Y, d.Buttons.Y);
+        Buttons.LeftShoulder = ValidateButton(fileName, "Buttons.LeftShoulder", Buttons.LeftShoulder, d.Buttons.LeftShoulder);
+        Buttons.RightShoulder = ValidateButton(fileName, "Buttons.RightShoulder", Buttons.RightShoulder, d.Buttons.RightShoulder);
+        Buttons.Back = ValidateButton(fileName, "Buttons.Back", Buttons.Back, d.Buttons.Back);
+        Buttons.Start = ValidateButton(fileName, "Buttons.Start", Buttons.Start, d.Buttons.Start);
+        Buttons.LeftThumb = ValidateButton(fileName, "Buttons.LeftThumb", Buttons.LeftThumb, d.Buttons.LeftThumb);
+        Buttons.RightThumb = ValidateButton(fileName, "Buttons.RightThumb", Buttons.RightThumb, d.Buttons.RightThumb);
+        Buttons.Guide = ValidateButton(fileName, "Buttons.Guide", Buttons.Guide, d.Buttons.Guide);
+
+        LeftTriggerButton = ValidateButton(fileName, "LeftTriggerButton", LeftTriggerButton, d.LeftTriggerButton);
+        RightTriggerButton = ValidateButton(fileName, "RightTriggerButton", RightTriggerButton, d.RightTriggerButton);
+        DpadUpButton = ValidateButton(fileName, "DpadUpButton", DpadUpButton, d.DpadUpButton);
+        DpadDownButton = ValidateButton(fileName, "DpadDownButton", DpadDownButton, d.DpadDownButton);
+        DpadLeftButton = ValidateButton(fileName, "DpadLeftButton", DpadLeftButton, d.DpadLeftButton);
+        DpadRightButton = ValidateButton(fileName, "DpadRightButton", DpadRightButton, d.DpadRightButton);
+
+        if (PovIndex is < 0 or > 3)
+        {
+            Log.Warn($"Mapping {fileName}: PovIndex ({PovIndex}) is out of range 0..3 - using default {d.PovIndex}");
+            PovIndex = d.PovIndex;
+        }
+    }
+
+    private static int ValidateAxis(string file, string name, int val, int fallback)
+    {
+        if (val is < 0 or > 5)
+        {
+            Log.Warn($"Mapping {file}: {name} ({val}) is out of range 0..5 - using default {fallback}");
+            return fallback;
+        }
+        return val;
+    }
+
+    private static int ValidateButton(string file, string name, int val, int fallback)
+    {
+        if (val is < -1 or >= 128)
+        {
+            Log.Warn($"Mapping {file}: {name} ({val}) is out of range -1..127 - using default {fallback}");
+            return fallback;
+        }
+        return val;
     }
 
     // Starting point per known layout - always verify with --calibrate.

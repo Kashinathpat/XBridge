@@ -3,7 +3,7 @@
 
 #define AppName       "XBridge"
 #define AppShortName  "XBridge"
-#define AppVersion    "2.3.0"
+#define AppVersion    "2.4.0"
 #define AppPublisher  "XBridge"
 #define AppExe        "XBridge.exe"
 #define PublishDir    "..\publish"
