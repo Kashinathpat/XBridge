@@ -61,6 +61,11 @@ internal sealed class ControllerSession : IDisposable
 
     private JoystickState _state = new();
     private XboxState _xb;
+    private XboxState _lastSubmittedXb;
+    private bool _hasSubmitted;
+    private long _lastSubmitMs;
+    private long _lastReportRateLogMs;
+    private int _reportsSubmittedSinceLog;
 
     private int _disposed;
     private int _faultReported;
@@ -247,8 +252,32 @@ internal sealed class ControllerSession : IDisposable
             {
                 _parser!.Parse(_rxInput, _state);
                 _mapper.Map(_state, ref _xb);
-                PushToPad();
-                try { _pad!.SubmitReport(); } catch (Exception ex) { Log.Warn($"[{ShortId}] SubmitReport: {ex.Message}"); }
+
+                long now = Environment.TickCount64;
+                bool stateChanged = !_hasSubmitted || !_xb.Equals(_lastSubmittedXb);
+                bool keepAliveDue = (now - _lastSubmitMs) >= 1500;
+
+                if (stateChanged || keepAliveDue)
+                {
+                    PushToPad();
+                    try
+                    {
+                        _pad!.SubmitReport();
+                        _lastSubmittedXb = _xb;
+                        _lastSubmitMs = now;
+                        _hasSubmitted = true;
+                        _reportsSubmittedSinceLog++;
+                    }
+                    catch (Exception ex) { Log.Warn($"[{ShortId}] SubmitReport: {ex.Message}"); }
+                }
+
+                if (now - _lastReportRateLogMs >= 60000)
+                {
+                    if (_lastReportRateLogMs > 0)
+                        Log.Debug($"[{ShortId}] IOCTL rate: {_reportsSubmittedSinceLog} reports in last minute ({_reportsSubmittedSinceLog / 60.0:F1}/s)");
+                    _reportsSubmittedSinceLog = 0;
+                    _lastReportRateLogMs = now;
+                }
             }
             ServiceRumble(Environment.TickCount64);
         }

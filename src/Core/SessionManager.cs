@@ -26,6 +26,7 @@ internal sealed class SessionManager
     private readonly HashSet<string> _warnedRawInput = new();
     private readonly Dictionary<(ushort vid, ushort pid), InputMapper> _mappers = new();
     private DateTime _lastCloakReassert = DateTime.MinValue;
+    private DateTime _lastGcLog = DateTime.MinValue;
 
     private readonly AppConfig _cfg;
     private readonly HidHideManager _hidHide;
@@ -36,6 +37,7 @@ internal sealed class SessionManager
 
     private System.Threading.Timer? _periodicTimer;
     private System.Threading.Timer? _debounceTimer;
+    private System.Threading.Timer? _followupTimer;
     private int _reconcilePending;
     private int _disposedFlag;
     private volatile bool _started;
@@ -128,11 +130,33 @@ internal sealed class SessionManager
     private static string KeyOf(GamepadUnit u) =>
         u.HasHidPath ? u.HidDevicePath!.Trim().ToLowerInvariant() : "di:" + u.DiInstanceGuid;
 
+    private bool HasPending(DateTime now) =>
+        _unpairedPasses.Count > 0 || _missingPasses.Count > 0 || _cooldownUntil.Values.Any(u => u > now);
+
     private void ReconcileOnce(string trigger)
     {
-        var present = DevicePairer.Enumerate(_cfg.Devices);
+        DateTime now = DateTime.UtcNow;
+        bool hasPending = HasPending(now);
+        bool allHealthy = !hasPending && _sessions.Values.All(s => s.Status == SessionStatus.Running);
+        bool forceRefresh = trigger is "device-change" or "resume" or "resume-2" or "startup";
+
+        var present = DevicePairer.Enumerate(_cfg.Devices, allHealthy, forceRefresh, hasPending, _sessions.Count > 0);
         var presentByKey = new Dictionary<string, GamepadUnit>();
         foreach (var u in present) presentByKey[KeyOf(u)] = u;
+
+        var presentGuids = new HashSet<Guid>(present.Select(p => p.DiInstanceGuid));
+        foreach (var g in _unpairedPasses.Keys.ToArray())
+            if (!presentGuids.Contains(g)) _unpairedPasses.Remove(g);
+
+        foreach (var (k, until) in _cooldownUntil.ToArray())
+            if (until <= now || !presentByKey.ContainsKey(k)) _cooldownUntil.Remove(k);
+
+        if (DateTime.UtcNow - _lastGcLog > TimeSpan.FromMinutes(30))
+        {
+            _lastGcLog = DateTime.UtcNow;
+            long mem = GC.GetTotalMemory(false);
+            Log.Debug($"GC memory: {mem / (1024 * 1024.0):F2} MB (gen0: {GC.CollectionCount(0)}, gen1: {GC.CollectionCount(1)}, gen2: {GC.CollectionCount(2)})");
+        }
 
         // A totally-empty enumeration while sessions are running is almost always an
         // enumeration hiccup - a faulted session still gets cleaned, absent ones do not.
@@ -192,12 +216,7 @@ internal sealed class SessionManager
             string key = KeyOf(unit);
             Guid guid = unit.DiInstanceGuid;
             if (_sessions.ContainsKey(key)) continue;
-
-            if (_cooldownUntil.TryGetValue(key, out var until))
-            {
-                if (DateTime.UtcNow < until) continue;
-                _cooldownUntil.Remove(key);
-            }
+            if (_cooldownUntil.ContainsKey(key)) continue;
 
             if (_sessions.Count >= _cfg.EffectiveMaxControllers)
             {
@@ -216,6 +235,7 @@ internal sealed class SessionManager
                     continue;
                 }
                 Log.Warn($"Reconcile({trigger}): {Short(guid)} still unpaired after {u} passes.");
+                _unpairedPasses.Remove(guid);
             }
             else
             {
@@ -269,6 +289,37 @@ internal sealed class SessionManager
         }
 
         PublishState();
+        ScheduleFollowupIfNeeded();
+    }
+
+    private void ScheduleFollowupIfNeeded()
+    {
+        if (_disposed) return;
+        DateTime now = DateTime.UtcNow;
+        if (!HasPending(now))
+        {
+            try { _followupTimer?.Change(Timeout.Infinite, Timeout.Infinite); }
+            catch (ObjectDisposedException) { }
+            return;
+        }
+
+        int dueMs;
+        if (_unpairedPasses.Count > 0 || _missingPasses.Count > 0)
+        {
+            dueMs = 3000;
+        }
+        else
+        {
+            var nextCooldown = _cooldownUntil.Values.Where(u => u > now).Min();
+            dueMs = (int)Math.Max(500, (nextCooldown - now).TotalMilliseconds);
+        }
+
+        try
+        {
+            _followupTimer ??= new System.Threading.Timer(_ => SafeReconcile("retry"), null, Timeout.Infinite, Timeout.Infinite);
+            _followupTimer.Change(dueMs, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException) { }
     }
 
     private void OnSessionFaulted(ControllerSession s)
@@ -380,6 +431,7 @@ internal sealed class SessionManager
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { _periodicTimer?.Dispose(); } catch { }
         try { _debounceTimer?.Dispose(); } catch { }
+        try { _followupTimer?.Dispose(); } catch { }
 
         lock (_lock)
         {

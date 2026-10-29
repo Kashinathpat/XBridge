@@ -2,7 +2,7 @@ using System.Text;
 
 namespace XBridge.Diagnostics;
 
-internal enum LogLevel { Info, Warn, Error }
+internal enum LogLevel { Debug, Info, Warn, Error }
 
 // Rolling, size-capped log under %LocalAppData%\XBridge\logs. Thread-safe;
 // safe to call before Init (messages are buffered).
@@ -10,6 +10,8 @@ internal static class Log
 {
     private static readonly object Gate = new();
     private static readonly List<string> PreInitBuffer = new();
+
+    public static LogLevel MinimumLevel { get; set; } = LogLevel.Info;
 
     private static string _dir = "";
     private static string _file = "";
@@ -49,6 +51,7 @@ internal static class Log
 
     public static void EnableConsoleMirror() => _mirrorToConsole = true;
 
+    public static void Debug(string m) => Emit(LogLevel.Debug, m);
     public static void Info(string m) => Emit(LogLevel.Info, m);
     public static void Warn(string m) => Emit(LogLevel.Warn, m);
     public static void Error(string m) => Emit(LogLevel.Error, m);
@@ -58,6 +61,7 @@ internal static class Log
 
     private static void Emit(LogLevel level, string message)
     {
+        if (level < MinimumLevel) return;
         string line = Format(level, message);
         lock (Gate)
         {
@@ -77,7 +81,7 @@ internal static class Log
 
     private static string Format(LogLevel level, string message)
     {
-        string tag = level switch { LogLevel.Info => "INF", LogLevel.Warn => "WRN", _ => "ERR" };
+        string tag = level switch { LogLevel.Debug => "DBG", LogLevel.Info => "INF", LogLevel.Warn => "WRN", _ => "ERR" };
         return $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{tag}] [t{Environment.CurrentManagedThreadId:D2}] {message}";
     }
 

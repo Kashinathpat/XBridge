@@ -3,12 +3,20 @@ using Vortice.DirectInput;
 
 namespace XBridge.Input;
 
-internal struct XboxState
+internal struct XboxState : IEquatable<XboxState>
 {
     public short LX, LY, RX, RY;
     public byte LT, RT;
     public bool A, B, X, Y, LB, RB, Back, Start, LS, RS, Guide;
     public bool DUp, DDown, DLeft, DRight;
+
+    public readonly bool Equals(XboxState o) =>
+        LX == o.LX && LY == o.LY && RX == o.RX && RY == o.RY &&
+        LT == o.LT && RT == o.RT &&
+        A == o.A && B == o.B && X == o.X && Y == o.Y &&
+        LB == o.LB && RB == o.RB && Back == o.Back && Start == o.Start &&
+        LS == o.LS && RS == o.RS && Guide == o.Guide &&
+        DUp == o.DUp && DDown == o.DDown && DLeft == o.DLeft && DRight == o.DRight;
 }
 
 // JoystickState -> XboxState. Allocation-free on the hot path. One instance shared by every session.

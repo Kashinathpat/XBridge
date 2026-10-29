@@ -28,12 +28,25 @@ internal sealed record GamepadUnit(
 internal static class DevicePairer
 {
     private static string _lastSignature = "";   // so the per-unit line isn't logged on every re-scan
+    private static HashSet<string> _lastHidPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static List<GamepadUnit> _lastUnits = new();
 
-    public static List<GamepadUnit> Enumerate(IReadOnlyList<DeviceId> devices)
+    public static List<GamepadUnit> Enumerate(
+        IReadOnlyList<DeviceId> devices,
+        bool allSessionsHealthy = false,
+        bool forceRefresh = false,
+        bool hasPending = false,
+        bool hasRunningSessions = false)
     {
-        var diList = EnumerateDirectInput(devices);
-        var hidList = EnumerateHid(devices);
-        var pnpIds = HidHideManager.EnumerateInstancePaths(devices).ToList();
+        bool allowRetry = forceRefresh || hasPending || hasRunningSessions;
+        var hidList = EnumerateHid(devices, allowRetry);
+        var currentPaths = new HashSet<string>(hidList.Select(h => h.DevicePath), StringComparer.OrdinalIgnoreCase);
+        if (!forceRefresh && allSessionsHealthy && currentPaths.SetEquals(_lastHidPaths))
+            return _lastUnits;
+
+        var diList = EnumerateDirectInput(devices, allowRetry);
+        var pnpIds = HidHideManager.EnumerateInstancePaths(devices, forceRefresh: forceRefresh).ToList();
+        bool wmiRefreshed = forceRefresh;
 
         // Pair within each VID/PID group so a pad is never matched to another model's HID node or
         // cloak id. Unambiguous exact matches (DIPROP_GUIDANDPATH == HidDevice.DevicePath) are kept;
@@ -74,9 +87,20 @@ internal static class DevicePairer
                 }
 
                 // Derive the cloak id from the HID device path (reliable) not the DI path (may collide).
+                string token = hid is not null ? InstanceToken(hid.DevicePath) : InstanceToken(ifacePath);
                 string? cloakId = hid is not null
-                    ? DeriveInstanceId(hid.DevicePath, pnpIds, InstanceToken(hid.DevicePath))
-                    : DeriveInstanceId(ifacePath, pnpIds, InstanceToken(ifacePath));
+                    ? DeriveInstanceId(hid.DevicePath, pnpIds, token)
+                    : DeriveInstanceId(ifacePath, pnpIds, token);
+
+                if (cloakId is null && token.Length > 0 && !wmiRefreshed)
+                {
+                    pnpIds = HidHideManager.EnumerateInstancePaths(devices, forceRefresh: true).ToList();
+                    wmiRefreshed = true;
+                    cloakId = hid is not null
+                        ? DeriveInstanceId(hid.DevicePath, pnpIds, token)
+                        : DeriveInstanceId(ifacePath, pnpIds, token);
+                }
+
                 cloakId ??= i < groupPnp.Count ? groupPnp[i] : null;   // last resort: a same-model WMI id by position
 
                 if (hid is null)
@@ -98,20 +122,23 @@ internal static class DevicePairer
                 Log.Info($"Pairing[{u.Short}]: {u.MatchKind}  VID {u.Vid:X4}/PID {u.Pid:X4}  DI='{Ellipsis(u.DiInterfacePath)}'  <->  " +
                          $"HID='{Ellipsis(u.HidDevicePath ?? "<none>")}'  hidHide='{u.HidHideInstancePath ?? "<none>"}'  maxOut={u.HidMaxOutputLength}");
         }
+        _lastHidPaths = currentPaths;
+        _lastUnits = units;
         return units;
     }
 
     // Never cache DIPROP_GUIDANDPATH by guid: DirectInput reassigns InstanceGuids among
     // identical (same VID/PID, no serial) devices when the attached set changes.
     private static List<(Guid guid, ushort vid, ushort pid, string name, string ifacePath)> EnumerateDirectInput(
-        IReadOnlyList<DeviceId> devices)
+        IReadOnlyList<DeviceId> devices, bool allowRetry)
     {
         var result = new List<(Guid, ushort, ushort, string, string)>();
 
-        // DI enumeration is racy right after a USB change; on an empty result, retry once.
-        for (int attempt = 0; attempt < 2 && result.Count == 0; attempt++)
+        // DirectInput enum is racy after USB change; retries once when needed.
+        int maxAttempts = allowRetry ? 2 : 1;
+        for (int attempt = 0; attempt < maxAttempts && result.Count == 0; attempt++)
         {
-            if (attempt == 1) Thread.Sleep(200);
+            if (attempt > 0) Thread.Sleep(200);
             IDirectInput8? di = null;
             try
             {
@@ -157,26 +184,27 @@ internal static class DevicePairer
         }
     }
 
-    private static List<HidDevice> EnumerateHid(IReadOnlyList<DeviceId> devices)
+    private static List<HidDevice> EnumerateHid(IReadOnlyList<DeviceId> devices, bool allowRetry)
     {
-        // HidSharp can briefly return nothing while Windows re-enumerates the HID stack
-        // after a sibling on the same hub/controller is unplugged - retry once.
-        for (int attempt = 0; ; attempt++)
+        // HidSharp can briefly return empty; retries once when needed.
+        int maxAttempts = allowRetry ? 2 : 1;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             try
             {
                 var list = DeviceList.Local.GetHidDevices()
                     .Where(h => devices.Any(x => x.Matches((ushort)h.VendorID, (ushort)h.ProductID)))
                     .ToList();
-                if (list.Count > 0 || attempt == 1) return list;
+                if (list.Count > 0 || attempt == maxAttempts - 1) return list;
             }
             catch (Exception ex)
             {
                 Log.Error("DevicePairer: HidSharp enumeration failed", ex);
-                if (attempt == 1) return new();
+                if (attempt == maxAttempts - 1) return new();
             }
             Thread.Sleep(200);
         }
+        return new();
     }
 
     private static string? ResolveHidHidePath(string token, List<string> pnpIds) =>

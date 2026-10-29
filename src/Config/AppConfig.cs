@@ -44,7 +44,7 @@ internal sealed class AppConfig
     public int FaultCooldownSeconds { get; set; } = 15;
 
     // safety-net re-enumeration interval, seconds (also covers sleep/resume)
-    public int ReenumerateSeconds { get; set; } = 3;
+    public int ReenumerateSeconds { get; set; } = 30;
     // debounce window for WM_DEVICECHANGE bursts, ms
     public int DeviceChangeDebounceMs { get; set; } = 400;
     // consecutive enumerations a running session may be missing before it's torn down (DI enum is racy during hot-plug)
@@ -52,7 +52,7 @@ internal sealed class AppConfig
     // reconciles to wait for a new unit's DI<->HID pairing to resolve before reporting it can't be paired
     public int PairRetryPasses { get; set; } = 6;
     // re-assert the HidHide block for running sessions this often, seconds (0 = off); guards against HidHide state drift
-    public int CloakReassertSeconds { get; set; } = 30;
+    public int CloakReassertSeconds { get; set; } = 120;
 
     // don't expose a virtual pad unless the physical one was cloaked
     public bool RequireCloak { get; set; } = true;
@@ -64,6 +64,7 @@ internal sealed class AppConfig
     // DragonRise quirk: send 0x0B when the weak value would be 0x0A
     public bool RumbleWeak0x0AQuirk { get; set; } = true;
 
+    public string LogLevel { get; set; } = "Info";
     public long LogMaxBytes { get; set; } = 1_048_576;
     public int LogMaxFiles { get; set; } = 5;
 
@@ -144,5 +145,9 @@ internal sealed class AppConfig
         RumbleKeepAliveMs = Math.Clamp(RumbleKeepAliveMs, 100, 10000);
         LogMaxBytes = Math.Max(64 * 1024, LogMaxBytes);
         LogMaxFiles = Math.Clamp(LogMaxFiles, 1, 50);
+        if (Enum.TryParse<LogLevel>(LogLevel, true, out var lvl))
+            Log.MinimumLevel = lvl;
+        else
+            Log.Warn($"Config: invalid LogLevel '{LogLevel}' (expected Debug, Info, Warn, Error) - defaulting to Info");
     }
 }

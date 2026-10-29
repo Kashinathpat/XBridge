@@ -131,30 +131,41 @@ internal sealed class HidHideManager
         return true;
     }
 
+    private static readonly object WmiGate = new();
+    private static List<string>? _cachedPnpIds;
+
     // Present HID PnP instance ids for the configured devices (WMI - sees cloaked devices too).
-    public static IReadOnlyList<string> EnumerateInstancePaths(IReadOnlyList<DeviceId> devices)
+    public static IReadOnlyList<string> EnumerateInstancePaths(IReadOnlyList<DeviceId> devices, bool forceRefresh = false)
     {
-        var list = new List<string>();
-        try
+        lock (WmiGate)
         {
-            using var searcher = new ManagementObjectSearcher(
-                "root\\CIMV2", "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE 'HID\\\\%'");
-            using var results = searcher.Get();
-            foreach (ManagementBaseObject mo in results)
+            if (!forceRefresh && _cachedPnpIds is not null)
+                return _cachedPnpIds;
+
+            var list = new List<string>();
+            try
             {
-                if (mo["DeviceID"] is string id && id.Length > 0
-                    && TryExtractVidPid(id, out var v, out var p)
-                    && devices.Any(d => d.Matches(v, p)))
-                    list.Add(id);
-                mo.Dispose();
+                using var searcher = new ManagementObjectSearcher(
+                    "root\\CIMV2", "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE 'HID\\\\%'");
+                using var results = searcher.Get();
+                foreach (ManagementBaseObject mo in results)
+                {
+                    if (mo["DeviceID"] is string id && id.Length > 0
+                        && TryExtractVidPid(id, out var v, out var p)
+                        && devices.Any(d => d.Matches(v, p)))
+                        list.Add(id);
+                    mo.Dispose();
+                }
+                list.Sort(StringComparer.OrdinalIgnoreCase);
+                _cachedPnpIds = list;
+                return _cachedPnpIds;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("WMI enumeration of HidHide instance ids failed", ex);
+                return _cachedPnpIds ?? list;
             }
         }
-        catch (Exception ex)
-        {
-            Log.Error("WMI enumeration of HidHide instance ids failed", ex);
-        }
-        list.Sort(StringComparer.OrdinalIgnoreCase);
-        return list;
     }
 
     // Blocks are deliberately never removed while the app runs or exits: the kernel decides at
@@ -164,7 +175,7 @@ internal sealed class HidHideManager
     {
         if (!s.BlockedInstanceIds.Contains(instanceId, StringComparer.OrdinalIgnoreCase))
             s.AddBlockedInstanceId(instanceId);
-    });
+    }, quietSuccess: true);
 
     // Bring one device fully under HidHide: allow-list this exe, block the device, enable hiding.
     // The id is recorded before blocking, so a failed write never leaves a block cleanup can't find.
@@ -258,14 +269,14 @@ internal sealed class HidHideManager
     private bool IsOurs(string instanceId) =>
         TryExtractVidPid(instanceId, out var v, out var p) && _devices.Any(d => d.Matches(v, p));
 
-    private bool Mutate(string what, Action<IHidHideControlService> act)
+    private bool Mutate(string what, Action<IHidHideControlService> act, bool quietSuccess = false)
     {
         lock (_gate)
         {
             try
             {
                 Call(s => { act(s); return true; });
-                Log.Info($"HidHide: {what} ok");
+                if (!quietSuccess) Log.Info($"HidHide: {what} ok");
                 LastErrorWasBusy = false;
                 return true;
             }
